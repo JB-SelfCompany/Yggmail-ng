@@ -1,0 +1,36 @@
+[package]
+name = "yggmail"
+version = "0.1.0"
+edition = "2024"
+description = "P2P email server over Yggdrasil mesh network"
+license = "MPL-2.0"
+
+[lib]
+name = "yggmail"
+path = "src/lib.rs"
+
+[dependencies]
+ironwood = { path = "../../../Yggdrasil-ng/crates/ironwood" }
+yggdrasil = { path = "../../../Yggdrasil-ng/crates/yggdrasil", default-features = false }
+tokio = { version = "1", features = ["full"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+rand = "0.8"
+async-trait = "0.1"
+
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+
+# imap-rs — RFC 3501 compliant IMAP4rev1 server (replaces hand-written parser)
+imap-core = { path = "../../../imap-rs/imap-core" }
+imap-server = { path = "../../../imap-rs/imap-server" }
+
+[dev-dependencies]
+tokio-test = "0.4"
+async-trait = "0.1"

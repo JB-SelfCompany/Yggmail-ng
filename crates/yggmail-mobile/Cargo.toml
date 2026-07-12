@@ -1,0 +1,38 @@
+[package]
+name = "yggmail-mobile"
+version = "0.1.0"
+edition = "2024"
+description = "Mobile FFI layer for yggmail-ng"
+license = "MPL-2.0"
+
+[lib]
+name = "yggmail_mobile"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+yggmail = { path = "../yggmail" }
+yggdrasil = { path = "../../../Yggdrasil-ng/crates/yggdrasil", default-features = false }
+ironwood = { path = "../../../Yggdrasil-ng/crates/ironwood" }
+tokio = { version = "1", features = ["full"] }
+uniffi = { version = "=0.31.1", features = ["build", "cli"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+hex = "0.4"
+thiserror = "2"
+serde_json = "1"
+sha2 = "0.10"
+rusqlite = { version = "0.32", features = ["bundled"] }
+rand = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+tracing-android = "0.2"
+
+[build-dependencies]
+uniffi = { version = "=0.31.1", features = ["build"] }
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+test = false

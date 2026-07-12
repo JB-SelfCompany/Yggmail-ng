@@ -1,0 +1,90 @@
+namespace yggmail_mobile {};
+
+[Error]
+enum YggmailError {
+    "Config",
+    "Runtime",
+    "Io",
+    "Network",
+};
+
+dictionary YggmailConfig {
+    string          private_key;
+    sequence<string> peers;
+    sequence<string> listen;
+    string          group_password;
+    string          database_path;
+    u16             smtp_port;
+    u16             imap_port;
+    string          password_hash;
+};
+
+dictionary YggmailState {
+    string  address;
+    string  public_key;
+    u32     inbox_count;
+    u32     peers_connected;
+    u32     routing_entries;
+};
+
+dictionary MailSummary {
+    u32     id;
+    string  from;
+    string  subject;
+    u64     date_secs;
+    boolean seen;
+    u32     size;
+};
+
+interface YggmailMobile {
+    [Throws=YggmailError]
+    constructor();
+
+    [Throws=YggmailError]
+    void start(YggmailConfig config);
+
+    void stop();
+
+    /// Send a plain-text email.
+    [Throws=YggmailError]
+    void send_mail(string to, string subject, string body);
+
+    /// Number of messages in INBOX.
+    u32 get_inbox_count();
+
+    /// Paginated mail summaries (most recent first).
+    sequence<MailSummary> get_mail_summaries(u32 page, u32 page_size);
+
+    /// Raw RFC 5322 message bytes for the given mailbox + id.
+    sequence<u8> get_mail_raw(string mailbox, u32 id);
+
+    /// Current node state snapshot.
+    YggmailState get_state();
+
+    // SMTP/IMAP server control
+    [Throws=YggmailError]
+    void start_smtp(u16 port, string password_hash);
+
+    [Throws=YggmailError]
+    void start_imap(u16 port, string password_hash);
+
+    void stop_smtp();
+
+    void stop_imap();
+
+    // Battery optimization
+    void set_active(boolean active);
+    void set_charging(boolean charging);
+
+    // Peer management
+    void update_peers(string peers_json);
+    string get_peer_connections_json();
+
+    // Storage/quota
+    void set_max_message_size_mb(u64 mb);
+    string get_max_message_size_info();
+    string get_mail_storage_stats();
+    u32 get_outbound_queue_count();
+    void clear_outbound_queue();
+    void set_password(string password);
+};
