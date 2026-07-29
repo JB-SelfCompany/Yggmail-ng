@@ -101,17 +101,31 @@ pub fn demux(
     let pump = inner.clone();
     tokio::spawn(async move {
         let mut buf = vec![0u8; PUMP_BUF_BYTES];
+        // Каждый маршрут отслеживается независимо: если один потребитель
+        // ушёл, насос не должен глохнуть для второго — иначе выживший вид
+        // тихо перестаёт получать входящий трафик, хотя write_to у него
+        // продолжает как ни в чём не бывало работать.
+        let mut ymp_alive = true;
+        let mut quic_alive = true;
         loop {
+            if !ymp_alive && !quic_alive {
+                break;
+            }
             match pump.read_from(&mut buf).await {
                 Ok((0, _)) => continue,
                 Ok((n, from)) => {
-                    let tx = if buf[0] & QUIC_FIXED_BIT != 0 { &quic_tx } else { &ymp_tx };
-                    if tx.send((buf[..n].to_vec(), from)).is_err() {
-                        break; // потребитель ушёл
+                    if buf[0] & QUIC_FIXED_BIT != 0 {
+                        if quic_alive && quic_tx.send((buf[..n].to_vec(), from)).is_err() {
+                            tracing::debug!("demux: quic consumer gone");
+                            quic_alive = false;
+                        }
+                    } else if ymp_alive && ymp_tx.send((buf[..n].to_vec(), from)).is_err() {
+                        tracing::debug!("demux: ymp consumer gone");
+                        ymp_alive = false;
                     }
                 }
                 Err(e) => {
-                    tracing::debug!("demux: read_from exiting: {e:?}");
+                    tracing::warn!("demux: read_from exiting: {e:?}");
                     break;
                 }
             }
@@ -238,6 +252,12 @@ pub(crate) mod testutil {
         async fn read_from(&self, buf: &mut [u8]) -> IwResult<(usize, Addr)> {
             match self.rx.lock().await.recv().await {
                 Some((data, from)) => {
+                    // Тихо режет, в отличие от DemuxedConn::read_from, который
+                    // дропает целиком. Это тестовый двойник, и такая простота
+                    // не мешает: единственный читатель — насос demux(), а он
+                    // всегда читает буфером PUMP_BUF_BYTES (65535), который
+                    // больше любой датаграммы mesh. Если PUMP_BUF_BYTES когда-
+                    // нибудь уменьшат, это предположение может тихо сломаться.
                     let n = data.len().min(buf.len());
                     buf[..n].copy_from_slice(&data[..n]);
                     Ok((n, from))
@@ -339,5 +359,34 @@ mod tests {
         let mut buf = [0u8; 8];
         let (n, _) = quic_view.read_from(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], &[0xC0, 0x77], "oversized must be dropped, not truncated");
+    }
+
+    /// Если один потребитель ушёл, насос обязан продолжать обслуживать
+    /// второй маршрут, а не глохнуть целиком (иначе выживший вид тихо
+    /// перестаёт получать входящий трафик). Проваливается на старом
+    /// поведении «break при первом неудачном send», потому что там весь
+    /// насос — и оба tx внутри него — исчезает вместе с первой же ошибкой.
+    #[tokio::test]
+    async fn surviving_view_keeps_working_after_other_drops() {
+        let (ka, kb) = keys();
+        let (a, b) = MemPacketConn::pair(ka.clone(), kb);
+        let (ymp_view, quic_view) = demux(a as Arc<dyn PacketConn>, ka);
+
+        // Получатель YMP-маршрута уходит первым...
+        drop(ymp_view);
+
+        // ...а трафик для мёртвого маршрута отправляется раньше трафика для
+        // живого, чтобы насос гарантированно наткнулся на неудачный send()
+        // до того, как дойдёт до QUIC-датаграммы — иначе тест прошёл бы
+        // и без починки.
+        b.write_to(&[0x10, 0x01], &Addr([0u8; 32])).await.unwrap();
+        b.write_to(&[0xC0, 0x02], &Addr([0u8; 32])).await.unwrap();
+
+        let mut buf = [0u8; 64];
+        let (n, _) = quic_view
+            .read_from(&mut buf)
+            .await
+            .expect("surviving QUIC route must still receive datagrams after YMP view is dropped");
+        assert_eq!(&buf[..n], &[0xC0, 0x02]);
     }
 }
