@@ -21,6 +21,9 @@ serde = { version = "1", features = ["derive"] }
 toml = "1"
 rand = "0.8"
 async-trait = "0.1"
+# Почтовый QUIC-оверлей (quinn поверх mesh, вместо YMP). Версии уже сошлись
+# в дереве под фичей `quic` у yggdrasil, поэтому граф не разъезжается.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
