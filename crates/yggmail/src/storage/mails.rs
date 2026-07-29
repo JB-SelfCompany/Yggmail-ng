@@ -60,7 +60,10 @@ pub fn insert(
         .unwrap_or_default()
         .as_secs() as i64;
     // Ensure the mailbox exists so it has a uid_next counter.
-    conn.execute("INSERT OR IGNORE INTO mailboxes (mailbox) VALUES (?1)", params![mailbox])?;
+    conn.execute(
+        "INSERT OR IGNORE INTO mailboxes (mailbox) VALUES (?1)",
+        params![mailbox],
+    )?;
     // Allocate a monotonic UID from the per-mailbox counter and bump it. Never
     // reuses an id after expunge, so IMAP UIDs stay strictly ascending.
     let id: u32 = conn.query_row(
@@ -68,7 +71,10 @@ pub fn insert(
         params![mailbox],
         |row| row.get(0),
     )?;
-    conn.execute("UPDATE mailboxes SET uid_next = uid_next + 1 WHERE mailbox = ?1", params![mailbox])?;
+    conn.execute(
+        "UPDATE mailboxes SET uid_next = uid_next + 1 WHERE mailbox = ?1",
+        params![mailbox],
+    )?;
     conn.execute(
         "INSERT INTO mails (mailbox, id, mail, datetime) VALUES (?1, ?2, ?3, ?4)",
         params![mailbox, id, blob, now],
@@ -102,13 +108,16 @@ pub fn get(
         Some(Ok(mut entry)) => {
             // Decrypt if the blob is an encrypted version-0x01 blob.
             if entry.mail.first() == Some(&super::crypt::VERSION_XCHACHA) {
-                let dk = key.ok_or_else(|| rusqlite::Error::InvalidParameterName(
-                    "at-rest: encrypted mail row found but no data key available".into(),
-                ))?;
-                entry.mail = super::crypt::aead_decrypt(dk, &entry.mail)
-                    .ok_or_else(|| rusqlite::Error::InvalidParameterName(
+                let dk = key.ok_or_else(|| {
+                    rusqlite::Error::InvalidParameterName(
+                        "at-rest: encrypted mail row found but no data key available".into(),
+                    )
+                })?;
+                entry.mail = super::crypt::aead_decrypt(dk, &entry.mail).ok_or_else(|| {
+                    rusqlite::Error::InvalidParameterName(
                         "at-rest: mail decryption failed — wrong key or corrupted blob".into(),
-                    ))?;
+                    )
+                })?;
             }
             // else: legacy plaintext blob — return as-is.
             Ok(Some(entry))
@@ -120,10 +129,9 @@ pub fn get(
 
 pub fn list_ids(db: &Arc<Mutex<Connection>>, mailbox: &str) -> Result<Vec<u32>, rusqlite::Error> {
     let conn = super::lock_db(db);
-    let mut stmt = conn.prepare(
-        "SELECT id FROM mails WHERE mailbox = ?1 ORDER BY id"
-    )?;
-    let ids: Vec<u32> = stmt.query_map(params![mailbox], |row| row.get(0))?
+    let mut stmt = conn.prepare("SELECT id FROM mails WHERE mailbox = ?1 ORDER BY id")?;
+    let ids: Vec<u32> = stmt
+        .query_map(params![mailbox], |row| row.get(0))?
         .filter_map(|r| r.ok())
         .collect();
     Ok(ids)
@@ -158,12 +166,18 @@ pub fn uid_next(db: &Arc<Mutex<Connection>>, mailbox: &str) -> Result<u32, rusql
         "SELECT uid_next FROM mailboxes WHERE mailbox = ?1",
         params![mailbox],
         |row| row.get(0),
-    ).or(Ok(1))
+    )
+    .or(Ok(1))
 }
 
 pub fn update_flags(
-    db: &Arc<Mutex<Connection>>, mailbox: &str, id: u32,
-    seen: bool, answered: bool, flagged: bool, deleted: bool,
+    db: &Arc<Mutex<Connection>>,
+    mailbox: &str,
+    id: u32,
+    seen: bool,
+    answered: bool,
+    flagged: bool,
+    deleted: bool,
 ) -> Result<(), rusqlite::Error> {
     let conn = super::lock_db(db);
     conn.execute(
@@ -175,27 +189,47 @@ pub fn update_flags(
 
 pub fn expunge(db: &Arc<Mutex<Connection>>, mailbox: &str) -> Result<(), rusqlite::Error> {
     let conn = super::lock_db(db);
-    conn.execute("DELETE FROM mails WHERE mailbox=?1 AND deleted=1", params![mailbox])?;
+    conn.execute(
+        "DELETE FROM mails WHERE mailbox=?1 AND deleted=1",
+        params![mailbox],
+    )?;
     Ok(())
 }
 
-pub fn delete_mail(db: &Arc<Mutex<Connection>>, mailbox: &str, id: u32) -> Result<(), rusqlite::Error> {
+pub fn delete_mail(
+    db: &Arc<Mutex<Connection>>,
+    mailbox: &str,
+    id: u32,
+) -> Result<(), rusqlite::Error> {
     let conn = super::lock_db(db);
-    conn.execute("UPDATE mails SET deleted=1 WHERE mailbox=?1 AND id=?2", params![mailbox, id])?;
+    conn.execute(
+        "UPDATE mails SET deleted=1 WHERE mailbox=?1 AND id=?2",
+        params![mailbox, id],
+    )?;
     Ok(())
 }
 
-pub fn move_mail(db: &Arc<Mutex<Connection>>, from: &str, to: &str, id: u32) -> Result<(), rusqlite::Error> {
+pub fn move_mail(
+    db: &Arc<Mutex<Connection>>,
+    from: &str,
+    to: &str,
+    id: u32,
+) -> Result<(), rusqlite::Error> {
     let conn = super::lock_db(db);
-    conn.execute("UPDATE mails SET mailbox=?1 WHERE mailbox=?2 AND id=?3", params![to, from, id])?;
+    conn.execute(
+        "UPDATE mails SET mailbox=?1 WHERE mailbox=?2 AND id=?3",
+        params![to, from, id],
+    )?;
     Ok(())
 }
 
 pub fn list_mailboxes(db: &Arc<Mutex<Connection>>) -> Result<Vec<String>, rusqlite::Error> {
     let conn = super::lock_db(db);
     let mut stmt = conn.prepare("SELECT mailbox FROM mailboxes ORDER BY mailbox")?;
-    let mbs: Vec<String> = stmt.query_map([], |row| row.get(0))?
-        .filter_map(|r| r.ok()).collect();
+    let mbs: Vec<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
     Ok(mbs)
 }
 
@@ -211,15 +245,32 @@ pub fn delete_mailbox(db: &Arc<Mutex<Connection>>, name: &str) -> Result<(), rus
     Ok(())
 }
 
-pub fn rename_mailbox(db: &Arc<Mutex<Connection>>, old: &str, new: &str) -> Result<(), rusqlite::Error> {
+pub fn rename_mailbox(
+    db: &Arc<Mutex<Connection>>,
+    old: &str,
+    new: &str,
+) -> Result<(), rusqlite::Error> {
     let conn = super::lock_db(db);
-    conn.execute("UPDATE mailboxes SET mailbox=?1 WHERE mailbox=?2", params![new, old])?;
-    conn.execute("UPDATE mails SET mailbox=?1 WHERE mailbox=?2", params![new, old])?;
+    conn.execute(
+        "UPDATE mailboxes SET mailbox=?1 WHERE mailbox=?2",
+        params![new, old],
+    )?;
+    conn.execute(
+        "UPDATE mails SET mailbox=?1 WHERE mailbox=?2",
+        params![new, old],
+    )?;
     Ok(())
 }
 
-pub fn subscribe_mailbox(db: &Arc<Mutex<Connection>>, name: &str, sub: bool) -> Result<(), rusqlite::Error> {
+pub fn subscribe_mailbox(
+    db: &Arc<Mutex<Connection>>,
+    name: &str,
+    sub: bool,
+) -> Result<(), rusqlite::Error> {
     let conn = super::lock_db(db);
-    conn.execute("UPDATE mailboxes SET subscribed=?1 WHERE mailbox=?2", params![sub, name])?;
+    conn.execute(
+        "UPDATE mailboxes SET subscribed=?1 WHERE mailbox=?2",
+        params![sub, name],
+    )?;
     Ok(())
 }

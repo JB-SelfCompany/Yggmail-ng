@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use ironwood::{new_encrypted_packet_conn, Addr, Config, EncryptedPacketConn, PacketConn};
+use ironwood::{Addr, Config, EncryptedPacketConn, PacketConn, new_encrypted_packet_conn};
 use rand::rngs::OsRng;
 use tokio::time::timeout;
 
@@ -168,7 +168,10 @@ async fn cross_hub_wedge_is_reproducible() {
             fails += 1;
         }
     }
-    eprintln!("cross_hub_wedge_is_reproducible: {}/{} attempts wedged", fails, trials);
+    eprintln!(
+        "cross_hub_wedge_is_reproducible: {}/{} attempts wedged",
+        fails, trials
+    );
     // Regression guard: before the return-path fix this wedged ~40% (8/20). With
     // `learn_path_from_traffic` in ironwood only the inherent rare single-packet
     // loss of a one-shot reply remains, so allow a small residual but catch any
@@ -199,7 +202,8 @@ async fn dump_node(label: &str, n: &Arc<EncryptedPacketConn>, peer: [u8; 32]) {
         eprintln!(
             "  {} pending: dest={} xformed={} age={:.2}s sent={} targets={}",
             label,
-            pl.dest_key.map_or("none".to_string(), |k| hex::encode(&k[..8])),
+            pl.dest_key
+                .map_or("none".to_string(), |k| hex::encode(&k[..8])),
             hex::encode(&pl.xformed_key[..8]),
             pl.age_secs,
             pl.sent,
@@ -272,8 +276,16 @@ async fn cross_hub_encrypted_wedge_diagnostic() {
             dump_node("D", &d, addr_a.0).await;
             let s1 = h1.get_debug_snapshot().await;
             let s2 = h2.get_debug_snapshot().await;
-            eprintln!("H1: coords={:?} root={}", s1.our_coords, hex::encode(&s1.tree_root[..8]));
-            eprintln!("H2: coords={:?} root={}", s2.our_coords, hex::encode(&s2.tree_root[..8]));
+            eprintln!(
+                "H1: coords={:?} root={}",
+                s1.our_coords,
+                hex::encode(&s1.tree_root[..8])
+            );
+            eprintln!(
+                "H2: coords={:?} root={}",
+                s2.our_coords,
+                hex::encode(&s2.tree_root[..8])
+            );
             for n in [&a, &h1, &h2, &d] {
                 let _ = n.close().await;
             }

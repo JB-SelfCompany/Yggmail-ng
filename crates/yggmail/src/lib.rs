@@ -1,6 +1,7 @@
 pub mod address;
 pub mod config;
 pub mod core_conn;
+pub mod identity;
 pub mod imap;
 pub mod peer;
 pub mod smtp;

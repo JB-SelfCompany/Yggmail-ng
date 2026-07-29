@@ -25,16 +25,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--help" | "-h" => { print_help(); return Ok(()); }
-            "--version" | "-V" => { println!("yggmail-ng {}", VERSION); return Ok(()); }
-            "--genconf" => { genconf = true; }
+            "--help" | "-h" => {
+                print_help();
+                return Ok(());
+            }
+            "--version" | "-V" => {
+                println!("yggmail-ng {}", VERSION);
+                return Ok(());
+            }
+            "--genconf" => {
+                genconf = true;
+            }
             "--config" | "-c" => {
                 i += 1;
-                if i < args.len() { yggdrasil_config_path = args[i].clone(); }
+                if i < args.len() {
+                    yggdrasil_config_path = args[i].clone();
+                }
             }
             "--yggmail-config" => {
                 i += 1;
-                if i < args.len() { yggmail_config_path = args[i].clone(); }
+                if i < args.len() {
+                    yggmail_config_path = args[i].clone();
+                }
             }
             _ => {}
         }
@@ -43,8 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -56,7 +67,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let yggmail_cfg = YggmailConfig::default();
         std::fs::write(&yggdrasil_config_path, toml::to_string_pretty(&cfg)?)?;
         std::fs::write(&yggmail_config_path, toml::to_string_pretty(&yggmail_cfg)?)?;
-        tracing::info!("Configs written: {}, {}", yggdrasil_config_path, yggmail_config_path);
+        tracing::info!(
+            "Configs written: {}, {}",
+            yggdrasil_config_path,
+            yggmail_config_path
+        );
         return Ok(());
     }
 
@@ -86,9 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              Configure your mail client (Thunderbird/Outlook) to use the above\r\n\
              servers with no authentication or encryption.\r\n\r\n\
              — The yggmail-ng team\r\n",
-            address, address, address,
-            yggmail_config.smtp_port,
-            yggmail_config.imap_port,
+            address, address, address, yggmail_config.smtp_port, yggmail_config.imap_port,
         );
         storage.mail_insert("INBOX", welcome.as_bytes())?;
         tracing::info!("Welcome email sent to {}", address);
@@ -108,7 +121,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Peer exchange ─────────────────────────────────────────────────
     let _receiver = peer::receiver::spawn(storage.clone(), ymp.clone());
     let _sender = peer::sender::spawn(
-        storage.clone(), ymp.clone(),
+        storage.clone(),
+        ymp.clone(),
         core.clone(),
         tokio::time::Duration::from_secs(30),
     );
@@ -116,9 +130,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── SMTP ──────────────────────────────────────────────────────────
     let smtp_storage = storage.clone();
     let _smtp = tokio::spawn(async move {
-        if let Err(e) = yggmail::smtp::serve(
-            yggmail_config.smtp_port, smtp_storage, public_key, None,
-        ).await { tracing::error!("SMTP: {e}"); }
+        if let Err(e) =
+            yggmail::smtp::serve(yggmail_config.smtp_port, smtp_storage, public_key, None).await
+        {
+            tracing::error!("SMTP: {e}");
+        }
     });
 
     // ── IMAP ──────────────────────────────────────────────────────────
@@ -129,13 +145,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let imap_storage = storage.clone();
     let _imap = tokio::spawn(async move {
         if let Err(e) = yggmail::imap::serve(
-            yggmail_config.imap_port, imap_storage, public_key, None, imap_notify_tx,
-        ).await { tracing::error!("IMAP: {e}"); }
+            yggmail_config.imap_port,
+            imap_storage,
+            public_key,
+            None,
+            imap_notify_tx,
+        )
+        .await
+        {
+            tracing::error!("IMAP: {e}");
+        }
     });
 
     tracing::info!(
         "SMTP 127.0.0.1:{}  IMAP 127.0.0.1:{}  Ctrl+C to stop",
-        yggmail_config.smtp_port, yggmail_config.imap_port
+        yggmail_config.smtp_port,
+        yggmail_config.imap_port
     );
 
     tokio::signal::ctrl_c().await?;
@@ -184,11 +209,14 @@ mod tests {
         tokio::spawn(async move {
             let (stream, _) = imap_listener.accept().await.unwrap();
             let (idle_tx, _) = tokio::sync::broadcast::channel(1);
-            let _ = yggmail::imap::handle_conn(stream, imap_storage, local_key, None, idle_tx).await;
+            let _ =
+                yggmail::imap::handle_conn(stream, imap_storage, local_key, None, idle_tx).await;
         });
 
         // ── SMTP: send a mail ────────────────────────────────────────
-        let mut smtp = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", smtp_port)).await.unwrap();
+        let mut smtp = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", smtp_port))
+            .await
+            .unwrap();
         let mut buf = vec![0u8; 4096];
         let _ = smtp.read(&mut buf).await.unwrap(); // greeting
 
@@ -196,7 +224,9 @@ mod tests {
         let _ = smtp.read(&mut buf).await.unwrap();
 
         let from = yggmail::address::create_address(&local_key);
-        smtp.write_all(format!("MAIL FROM:<{}>\r\n", from).as_bytes()).await.unwrap();
+        smtp.write_all(format!("MAIL FROM:<{}>\r\n", from).as_bytes())
+            .await
+            .unwrap();
         let _ = smtp.read(&mut buf).await.unwrap();
 
         smtp.write_all(b"RCPT TO:<bob@yggmail>\r\n").await.unwrap();
@@ -205,27 +235,39 @@ mod tests {
         smtp.write_all(b"DATA\r\n").await.unwrap();
         let _ = smtp.read(&mut buf).await.unwrap();
 
-        smtp.write_all(b"Subject: E2E Test\r\n\r\nEnd-to-end works!\r\n.\r\n").await.unwrap();
+        smtp.write_all(b"Subject: E2E Test\r\n\r\nEnd-to-end works!\r\n.\r\n")
+            .await
+            .unwrap();
         let _ = smtp.read(&mut buf).await.unwrap();
 
         smtp.write_all(b"QUIT\r\n").await.unwrap();
         let _ = smtp.read(&mut buf).await.unwrap();
 
         // ── IMAP: read the mail back ──────────────────────────────────
-        let mut imap = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", imap_port)).await.unwrap();
+        let mut imap = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", imap_port))
+            .await
+            .unwrap();
         let _ = imap.read(&mut buf).await.unwrap(); // greeting
 
         let user = hex::encode(local_key);
-        imap.write_all(format!("a001 LOGIN {} x\r\n", user).as_bytes()).await.unwrap();
+        imap.write_all(format!("a001 LOGIN {} x\r\n", user).as_bytes())
+            .await
+            .unwrap();
         let _ = imap.read(&mut buf).await.unwrap();
 
         imap.write_all(b"a002 SELECT Outbox\r\n").await.unwrap();
         let _ = imap.read(&mut buf).await.unwrap();
 
-        imap.write_all(b"a003 FETCH 1:* (BODY[])\r\n").await.unwrap();
+        imap.write_all(b"a003 FETCH 1:* (BODY[])\r\n")
+            .await
+            .unwrap();
         let n = imap.read(&mut buf).await.unwrap();
         let resp = String::from_utf8_lossy(&buf[..n]);
-        assert!(resp.contains("E2E Test"), "E2E: subject not found in IMAP response:\n{}", resp);
+        assert!(
+            resp.contains("E2E Test"),
+            "E2E: subject not found in IMAP response:\n{}",
+            resp
+        );
         assert!(resp.contains("End-to-end works!"), "E2E: body not found");
 
         imap.write_all(b"a004 LOGOUT\r\n").await.unwrap();
@@ -233,7 +275,9 @@ mod tests {
     }
 }
 
-fn load_yggdrasil_config(path: &str) -> Result<yggdrasil::config::Config, Box<dyn std::error::Error>> {
+fn load_yggdrasil_config(
+    path: &str,
+) -> Result<yggdrasil::config::Config, Box<dyn std::error::Error>> {
     if std::path::Path::new(path).exists() {
         let text = std::fs::read_to_string(path)?;
         Ok(toml::from_str(&text)?)

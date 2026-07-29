@@ -10,8 +10,8 @@
 //!   Version `0x00` / absent bytes = legacy plaintext (passthrough).
 
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
     XChaCha20Poly1305, XNonce,
+    aead::{Aead, KeyInit},
 };
 use rand::RngCore;
 use sha2::{Digest, Sha256};

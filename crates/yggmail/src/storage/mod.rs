@@ -3,9 +3,9 @@
 //! ponytail: writer channel skipped — rusqlite serializes writes internally.
 //! Prepared statements cached at startup for all hot paths.
 
+pub mod crypt;
 mod mails;
 mod queue;
-pub mod crypt;
 
 pub use mails::MailEntry;
 pub use queue::QueuedMail;
@@ -88,7 +88,10 @@ impl SqliteStorage {
         // Migrate older DBs: add the monotonic UID counter if missing, then lift
         // each mailbox's counter above any id already present so UIDs are never
         // reused (Delta Chat ignores mail whose UID is below its watermark).
-        let _ = conn.execute("ALTER TABLE mailboxes ADD COLUMN uid_next INTEGER NOT NULL DEFAULT 1", []);
+        let _ = conn.execute(
+            "ALTER TABLE mailboxes ADD COLUMN uid_next INTEGER NOT NULL DEFAULT 1",
+            [],
+        );
         conn.execute(
             "UPDATE mailboxes SET uid_next = MAX(
                  uid_next,
@@ -105,23 +108,22 @@ impl SqliteStorage {
         let at_rest_key = match password_hash {
             Some(h) if !h.is_empty() => {
                 // (1) Get-or-create the per-DB salt.
-                let salt: Vec<u8> = match conn.query_row(
-                    "SELECT v FROM at_rest WHERE k = 'salt'",
-                    [],
-                    |row| row.get::<_, Vec<u8>>(0),
-                ) {
-                    Ok(existing) => existing,
-                    Err(rusqlite::Error::QueryReturnedNoRows) => {
-                        let mut s = [0u8; 16];
-                        rand::thread_rng().fill_bytes(&mut s);
-                        conn.execute(
-                            "INSERT INTO at_rest (k, v) VALUES ('salt', ?1)",
-                            rusqlite::params![s.as_ref()],
-                        )?;
-                        s.to_vec()
-                    }
-                    Err(e) => return Err(e),
-                };
+                let salt: Vec<u8> =
+                    match conn.query_row("SELECT v FROM at_rest WHERE k = 'salt'", [], |row| {
+                        row.get::<_, Vec<u8>>(0)
+                    }) {
+                        Ok(existing) => existing,
+                        Err(rusqlite::Error::QueryReturnedNoRows) => {
+                            let mut s = [0u8; 16];
+                            rand::thread_rng().fill_bytes(&mut s);
+                            conn.execute(
+                                "INSERT INTO at_rest (k, v) VALUES ('salt', ?1)",
+                                rusqlite::params![s.as_ref()],
+                            )?;
+                            s.to_vec()
+                        }
+                        Err(e) => return Err(e),
+                    };
 
                 // (2) Derive KEK.
                 let kek = crypt::derive_kek(h, &salt);
@@ -190,11 +192,10 @@ impl SqliteStorage {
             None => return Ok(()),
         };
         let conn = lock_db(&self.db);
-        let salt: Vec<u8> = conn.query_row(
-            "SELECT v FROM at_rest WHERE k = 'salt'",
-            [],
-            |row| row.get::<_, Vec<u8>>(0),
-        )?;
+        let salt: Vec<u8> =
+            conn.query_row("SELECT v FROM at_rest WHERE k = 'salt'", [], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })?;
         let new_kek = crypt::derive_kek(new_password_hash, &salt);
         let new_wrapped = crypt::aead_encrypt(&new_kek, dk);
         conn.execute(
@@ -214,9 +215,8 @@ impl SqliteStorage {
         // also takes it; instead, collect all work first, then apply.
         let plaintext_rows: Vec<(String, u32, Vec<u8>)> = {
             let conn = lock_db(&self.db);
-            let mut stmt = conn.prepare(
-                "SELECT mailbox, id, mail FROM mails WHERE SUBSTR(mail, 1, 1) <> X'01'",
-            )?;
+            let mut stmt = conn
+                .prepare("SELECT mailbox, id, mail FROM mails WHERE SUBSTR(mail, 1, 1) <> X'01'")?;
             let rows: Vec<_> = stmt
                 .query_map([], |row| {
                     Ok((
@@ -328,7 +328,12 @@ impl SqliteStorage {
     }
 
     pub fn queue_insert(
-        &self, destination: &str, mailbox: &str, id: u32, from: &str, rcpt: &str,
+        &self,
+        destination: &str,
+        mailbox: &str,
+        id: u32,
+        from: &str,
+        rcpt: &str,
     ) -> Result<(), rusqlite::Error> {
         queue::insert(&self.db, destination, mailbox, id, from, rcpt)?;
         self.queue_notify.notify_one();
@@ -339,11 +344,19 @@ impl SqliteStorage {
         queue::list_destinations(&self.db)
     }
 
-    pub fn queue_get_for_destination(&self, dest: &str) -> Result<Vec<QueuedMail>, rusqlite::Error> {
+    pub fn queue_get_for_destination(
+        &self,
+        dest: &str,
+    ) -> Result<Vec<QueuedMail>, rusqlite::Error> {
         queue::get_for_destination(&self.db, dest)
     }
 
-    pub fn queue_delete(&self, destination: &str, mailbox: &str, id: u32) -> Result<(), rusqlite::Error> {
+    pub fn queue_delete(
+        &self,
+        destination: &str,
+        mailbox: &str,
+        id: u32,
+    ) -> Result<(), rusqlite::Error> {
         queue::delete(&self.db, destination, mailbox, id)
     }
 
@@ -378,8 +391,13 @@ impl SqliteStorage {
     // ── mail flag/move operations ──────────────────────────────────────
 
     pub fn mail_update_flags(
-        &self, mailbox: &str, id: u32,
-        seen: bool, answered: bool, flagged: bool, deleted: bool,
+        &self,
+        mailbox: &str,
+        id: u32,
+        seen: bool,
+        answered: bool,
+        flagged: bool,
+        deleted: bool,
     ) -> Result<(), rusqlite::Error> {
         mails::update_flags(&self.db, mailbox, id, seen, answered, flagged, deleted)
     }
@@ -414,7 +432,10 @@ mod tests {
         })
         .join();
 
-        assert!(db.lock().is_err(), "mutex should be poisoned after the panic");
+        assert!(
+            db.lock().is_err(),
+            "mutex should be poisoned after the panic"
+        );
 
         // Recovery path still yields a working connection.
         let conn = lock_db(&db);
@@ -456,7 +477,8 @@ mod tests {
         let s = temp_db("queue");
         s.mail_insert("Outbox", b"test mail").unwrap();
 
-        s.queue_insert("00ff", "Outbox", 1, "alice@yggmail", "bob@yggmail").unwrap();
+        s.queue_insert("00ff", "Outbox", 1, "alice@yggmail", "bob@yggmail")
+            .unwrap();
 
         let dests = s.queue_list_destinations().unwrap();
         assert_eq!(dests, vec!["00ff"]);
@@ -517,7 +539,10 @@ mod tests {
         let ids = s2.mail_list("INBOX").unwrap();
         assert_eq!(ids.len(), 1);
         let mail = s2.mail_get("INBOX", ids[0]).unwrap().unwrap();
-        assert_eq!(mail.mail, raw, "mail must decrypt correctly after password change");
+        assert_eq!(
+            mail.mail, raw,
+            "mail must decrypt correctly after password change"
+        );
     }
 
     #[test]
@@ -540,6 +565,9 @@ mod tests {
         let ids = s.mail_list("INBOX").unwrap();
         assert_eq!(ids.len(), 1);
         let mail = s.mail_get("INBOX", ids[0]).unwrap().unwrap();
-        assert_eq!(mail.mail, raw, "migrated plaintext mail must decrypt correctly");
+        assert_eq!(
+            mail.mail, raw,
+            "migrated plaintext mail must decrypt correctly"
+        );
     }
 }

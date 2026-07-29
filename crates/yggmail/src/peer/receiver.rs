@@ -8,10 +8,7 @@ use tracing;
 
 /// Start the inbound receiver background task.
 /// Reads assembled messages from YMP and stores them in INBOX.
-pub fn spawn(
-    storage: Arc<SqliteStorage>,
-    ymp: Arc<YmpSession>,
-) -> tokio::task::JoinHandle<()> {
+pub fn spawn(storage: Arc<SqliteStorage>, ymp: Arc<YmpSession>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match ymp.recv().await {

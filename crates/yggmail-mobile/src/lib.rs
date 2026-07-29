@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::sync::broadcast;
 
+#[cfg(test)]
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 
@@ -16,6 +17,7 @@ use yggdrasil::config::Config as YggdrasilConfig;
 use yggdrasil::core::Core;
 use yggmail::address::create_address;
 use yggmail::core_conn::CoreConn;
+use yggmail::identity::{load_or_migrate_identity, parse_signing_key};
 use yggmail::storage::SqliteStorage;
 use yggmail::ymp::YmpSession;
 
@@ -24,9 +26,9 @@ use yggmail::ymp::YmpSession;
 fn init_tracing() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
+        use tracing_subscriber::EnvFilter;
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
-        use tracing_subscriber::EnvFilter;
         let filter = EnvFilter::new("ironwood=info,yggmail=info,info");
         #[cfg(target_os = "android")]
         {
@@ -57,6 +59,15 @@ pub enum YggmailError {
     Io(String),
     #[error("Network: {0}")]
     Network(String),
+}
+
+impl From<yggmail::identity::IdentityError> for YggmailError {
+    fn from(e: yggmail::identity::IdentityError) -> Self {
+        match e {
+            yggmail::identity::IdentityError::Io(s) => YggmailError::Io(s),
+            yggmail::identity::IdentityError::Config(s) => YggmailError::Config(s),
+        }
+    }
 }
 
 // ── config / state types ───────────────────────────────────────────────
@@ -276,9 +287,15 @@ impl YggmailMobile {
         let mut guard = self.state.lock().unwrap();
         if let Some(ref node) = *guard {
             // Abort all background tasks
-            if let Some(h) = node.receiver_handle.as_ref() { h.abort(); }
-            if let Some(h) = node.smtp_handle.as_ref() { h.abort(); }
-            if let Some(h) = node.imap_handle.as_ref() { h.abort(); }
+            if let Some(h) = node.receiver_handle.as_ref() {
+                h.abort();
+            }
+            if let Some(h) = node.smtp_handle.as_ref() {
+                h.abort();
+            }
+            if let Some(h) = node.imap_handle.as_ref() {
+                h.abort();
+            }
             let _ = node.stop_tx.send(());
         }
         *guard = None;
@@ -290,17 +307,25 @@ impl YggmailMobile {
         let safe_body = body.replace('\r', "").replace('\n', " ");
 
         let state = self.state.lock().unwrap();
-        let node = state.as_ref().ok_or(YggmailError::Runtime("not started".into()))?;
+        let node = state
+            .as_ref()
+            .ok_or(YggmailError::Runtime("not started".into()))?;
 
-        let mail = format!("To: {}\r\nSubject: {}\r\n\r\n{}", to, safe_subject, safe_body);
-        let id = node.storage.mail_insert("Outbox", mail.as_bytes())
+        let mail = format!(
+            "To: {}\r\nSubject: {}\r\n\r\n{}",
+            to, safe_subject, safe_body
+        );
+        let id = node
+            .storage
+            .mail_insert("Outbox", mail.as_bytes())
             .map_err(|e| YggmailError::Runtime(e.to_string()))?;
 
         let dest = yggmail::address::parse_address(&to)
             .ok_or_else(|| YggmailError::Config(format!("invalid address: {}", to)))?;
 
         let from = create_address(node.core.public_key());
-        node.storage.queue_insert(&hex::encode(dest), "Outbox", id, &from, &to)
+        node.storage
+            .queue_insert(&hex::encode(dest), "Outbox", id, &from, &to)
             .map_err(|e| YggmailError::Runtime(e.to_string()))?;
 
         // Enqueue-only: the background sender task handles delivery (with the
@@ -312,32 +337,49 @@ impl YggmailMobile {
     }
 
     pub fn get_inbox_count(&self) -> u32 {
-        self.state.lock().unwrap().as_ref()
+        self.state
+            .lock()
+            .unwrap()
+            .as_ref()
             .and_then(|n| n.storage.mail_count("INBOX").ok())
             .unwrap_or(0)
     }
 
     pub fn get_mail_summaries(&self, page: u32, page_size: u32) -> Vec<MailSummary> {
         let state = self.state.lock().unwrap();
-        let node = match state.as_ref() { Some(n) => n, None => return vec![] };
+        let node = match state.as_ref() {
+            Some(n) => n,
+            None => return vec![],
+        };
         let ids = node.storage.mail_list("INBOX").unwrap_or_default();
-        ids.iter().skip((page * page_size) as usize).take(page_size as usize)
+        ids.iter()
+            .skip((page * page_size) as usize)
+            .take(page_size as usize)
             .filter_map(|id| {
-                node.storage.mail_get("INBOX", *id).ok().flatten().map(|m| MailSummary {
-                    id: m.id,
-                    from: extract_header(&m.mail, "From:").unwrap_or_default(),
-                    subject: extract_header(&m.mail, "Subject:").unwrap_or_default(),
-                    date_secs: m.date as u64,
-                    seen: m.seen,
-                    size: m.mail.len() as u32,
-                })
-            }).collect()
+                node.storage
+                    .mail_get("INBOX", *id)
+                    .ok()
+                    .flatten()
+                    .map(|m| MailSummary {
+                        id: m.id,
+                        from: extract_header(&m.mail, "From:").unwrap_or_default(),
+                        subject: extract_header(&m.mail, "Subject:").unwrap_or_default(),
+                        date_secs: m.date as u64,
+                        seen: m.seen,
+                        size: m.mail.len() as u32,
+                    })
+            })
+            .collect()
     }
 
     pub fn get_mail_raw(&self, mailbox: String, id: u32) -> Vec<u8> {
-        self.state.lock().unwrap().as_ref()
+        self.state
+            .lock()
+            .unwrap()
+            .as_ref()
             .and_then(|n| n.storage.mail_get(&mailbox, id).ok().flatten())
-            .map(|m| m.mail).unwrap_or_default()
+            .map(|m| m.mail)
+            .unwrap_or_default()
     }
 
     pub fn get_state(&self) -> YggmailState {
@@ -356,8 +398,11 @@ impl YggmailMobile {
                 }
             }
             None => YggmailState {
-                address: String::new(), public_key: String::new(),
-                inbox_count: 0, peers_connected: 0, routing_entries: 0,
+                address: String::new(),
+                public_key: String::new(),
+                inbox_count: 0,
+                peers_connected: 0,
+                routing_entries: 0,
             },
         }
     }
@@ -366,10 +411,16 @@ impl YggmailMobile {
 
     pub fn start_smtp(&self, port: u16, password_hash: String) -> Result<(), YggmailError> {
         let mut state = self.state.lock().unwrap();
-        let node = state.as_mut().ok_or(YggmailError::Runtime("not started".into()))?;
+        let node = state
+            .as_mut()
+            .ok_or(YggmailError::Runtime("not started".into()))?;
         let storage = node.storage.clone();
         let local_key = *node.core.public_key();
-        let pw = if password_hash.is_empty() { None } else { Some(password_hash) };
+        let pw = if password_hash.is_empty() {
+            None
+        } else {
+            Some(password_hash)
+        };
 
         let handle = self.runtime.handle().spawn(async move {
             if let Err(e) = yggmail::smtp::serve(port, storage, local_key, pw).await {
@@ -382,10 +433,16 @@ impl YggmailMobile {
 
     pub fn start_imap(&self, port: u16, password_hash: String) -> Result<(), YggmailError> {
         let mut state = self.state.lock().unwrap();
-        let node = state.as_mut().ok_or(YggmailError::Runtime("not started".into()))?;
+        let node = state
+            .as_mut()
+            .ok_or(YggmailError::Runtime("not started".into()))?;
         let storage = node.storage.clone();
         let local_key = *node.core.public_key();
-        let pw = if password_hash.is_empty() { None } else { Some(password_hash) };
+        let pw = if password_hash.is_empty() {
+            None
+        } else {
+            Some(password_hash)
+        };
 
         let notify_tx = node.imap_notify_tx.clone().unwrap();
         let handle = self.runtime.handle().spawn(async move {
@@ -433,7 +490,10 @@ impl YggmailMobile {
 
     pub fn update_peers(&self, peers_json: String) {
         let state = self.state.lock().unwrap();
-        let node = match state.as_ref() { Some(n) => n, None => return };
+        let node = match state.as_ref() {
+            Some(n) => n,
+            None => return,
+        };
 
         let desired: Vec<String> = match serde_json::from_str(&peers_json) {
             Ok(v) => v,
@@ -463,22 +523,28 @@ impl YggmailMobile {
 
     pub fn get_peer_connections_json(&self) -> String {
         let state = self.state.lock().unwrap();
-        let node = match state.as_ref() { Some(n) => n, None => return "[]".to_string() };
+        let node = match state.as_ref() {
+            Some(n) => n,
+            None => return "[]".to_string(),
+        };
 
         self.runtime.block_on(async {
             let peers = node.core.get_peers().await;
-            let list: Vec<serde_json::Value> = peers.iter().map(|p| {
-                serde_json::json!({
-                    "uri": p.uri,
-                    "up": p.up,
-                    "inbound": p.inbound,
-                    "key": hex::encode(p.key),
-                    "latencyMs": p.latency_ms,
-                    "rxBytes": p.rx_bytes,
-                    "txBytes": p.tx_bytes,
-                    "uptime": p.uptime_secs,
+            let list: Vec<serde_json::Value> = peers
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "uri": p.uri,
+                        "up": p.up,
+                        "inbound": p.inbound,
+                        "key": hex::encode(p.key),
+                        "latencyMs": p.latency_ms,
+                        "rxBytes": p.rx_bytes,
+                        "txBytes": p.tx_bytes,
+                        "uptime": p.uptime_secs,
+                    })
                 })
-            }).collect();
+                .collect();
             serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string())
         })
     }
@@ -497,7 +563,9 @@ impl YggmailMobile {
     pub fn get_mail_storage_stats(&self) -> String {
         let state = self.state.lock().unwrap();
         let db_size = match state.as_ref() {
-            Some(node) => std::fs::metadata(&node.db_path).map(|m| m.len()).unwrap_or(0),
+            Some(node) => std::fs::metadata(&node.db_path)
+                .map(|m| m.len())
+                .unwrap_or(0),
             None => 0,
         };
         let max_mb = self.max_message_size.load(Ordering::Relaxed);
@@ -505,12 +573,16 @@ impl YggmailMobile {
         serde_json::json!({
             "dbSizeMB": (db_size_mb * 100.0).round() / 100.0,
             "maxSizeMB": max_mb,
-        }).to_string()
+        })
+        .to_string()
     }
 
     pub fn get_outbound_queue_count(&self) -> u32 {
         let state = self.state.lock().unwrap();
-        let node = match state.as_ref() { Some(n) => n, None => return 0 };
+        let node = match state.as_ref() {
+            Some(n) => n,
+            None => return 0,
+        };
         let dests = node.storage.queue_list_destinations().unwrap_or_default();
         let mut total = 0u32;
         for d in dests {
@@ -523,7 +595,10 @@ impl YggmailMobile {
 
     pub fn clear_outbound_queue(&self) {
         let state = self.state.lock().unwrap();
-        let node = match state.as_ref() { Some(n) => n, None => return };
+        let node = match state.as_ref() {
+            Some(n) => n,
+            None => return,
+        };
         let dests = match node.storage.queue_list_destinations() {
             Ok(d) => d,
             Err(_) => return,
@@ -554,149 +629,26 @@ impl YggmailMobile {
     }
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────
-
-fn parse_signing_key(hex_key: &str) -> Result<ed25519_dalek::SigningKey, YggmailError> {
-    let bytes = hex::decode(hex_key).map_err(|e| YggmailError::Config(e.to_string()))?;
-    if bytes.len() != 64 {
-        return Err(YggmailError::Config(format!("key must be 64 bytes, got {}", bytes.len())));
-    }
-    let mut arr = [0u8; 64];
-    arr.copy_from_slice(&bytes);
-    ed25519_dalek::SigningKey::from_keypair_bytes(&arr)
-        .map_err(|e| YggmailError::Config(e.to_string()))
-}
-
-/// Load the node's Ed25519 identity from the DB, persisting it to `mobile_config`.
-///
-/// When `dk` (the at-rest data key) is `Some`, the stored value in `mobile_config`
-/// is the hex encoding of an XChaCha20-Poly1305 encrypted blob wrapping the
-/// plaintext `private_key_hex`.  Reading: hex-decode → if the bytes start with
-/// `0x01` → decrypt to recover `private_key_hex`; else treat the raw value as
-/// the legacy plaintext hex (never starts with 0x01 because it is 128 lowercase
-/// hex chars whose first byte is always a digit or a–f).  Writing: always store
-/// the encrypted form when `dk` is `Some`.
-///
-/// Order (precedence matters — see below):
-/// 1. **Migration 1.8→1.9 wins.** If the legacy Go `config.private_key` exists, it IS the
-///    user's real identity (yggmail_old stored it as 64-byte-keypair hex, the same layout
-///    as `to_keypair_bytes`). It MUST take precedence over `mobile_config`, because an
-///    older/buggy 1.9 build could have minted a *fresh random* key into `mobile_config`
-///    that would otherwise permanently shadow the real `@yggmail` address. We adopt the
-///    legacy key and (re)write it to `mobile_config`, healing any such poisoning.
-/// 2. No legacy key (a genuine fresh 1.9 install — `SqliteStorage` never creates `config`):
-///    reuse the key already persisted in `mobile_config`.
-/// 3. Truly fresh: mint a new key and persist it.
-///
-/// Only reads `config` — never mutates the legacy table.
-fn load_or_migrate_identity(
-    db_path: &str,
-    dk: Option<&[u8; 32]>,
-) -> Result<(ed25519_dalek::SigningKey, String), YggmailError> {
-    let conn = rusqlite::Connection::open(db_path).map_err(|e| YggmailError::Io(e.to_string()))?;
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS mobile_config (key TEXT PRIMARY KEY, value TEXT);")
-        .map_err(|e| YggmailError::Io(e.to_string()))?;
-
-    // (1) Legacy 1.8 key present → it is authoritative. Adopt + heal mobile_config.
-    // Legacy `config` always stores plaintext hex — no decryption needed here.
-    if let Some((key, hex_key)) = conn
-        .query_row("SELECT value FROM config WHERE key = 'private_key'", [], |r| {
-            r.get::<_, String>(0)
-        })
-        .ok()
-        .and_then(|h| parse_signing_key(&h).ok().map(|k| (k, h)))
-    {
-        persist_identity(&conn, &hex_key, dk)?;
-        tracing::info!("mobile: adopted legacy (1.8) identity from `config` — @yggmail address preserved");
-        return Ok((key, hex_key));
-    }
-
-    // (2) No legacy key: reuse the persisted 1.9 identity.
-    if let Some(stored_value) = conn
-        .query_row("SELECT value FROM mobile_config WHERE key = 'private_key'", [], |r| {
-            r.get::<_, String>(0)
-        })
-        .ok()
-    {
-        let plaintext_hex = decrypt_stored_key(&stored_value, dk)?;
-        if let Some(pair) = parse_signing_key(&plaintext_hex).ok().map(|k| (k, plaintext_hex.clone())) {
-            // Re-persist to ensure the stored form matches the current encryption mode
-            // (e.g., upgrade from plaintext to encrypted, or key rotation).
-            persist_identity(&conn, &plaintext_hex, dk)?;
-            return Ok(pair);
-        }
-    }
-
-    // (3) Truly fresh install: generate and persist.
-    let key = ed25519_dalek::SigningKey::generate(&mut OsRng);
-    let hex_key = hex::encode(key.to_keypair_bytes());
-    persist_identity(&conn, &hex_key, dk)?;
-    Ok((key, hex_key))
-}
-
-/// Decode a value stored in `mobile_config` for `private_key`.
-///
-/// Disambiguation rule (discriminate by LENGTH, not just the first byte):
-/// a legacy plaintext keypair hex-decodes to exactly 64 bytes, whereas an
-/// encrypted blob is `[0x01][nonce24][ct][tag16]` and is never 64 bytes.
-/// A legacy keypair's first byte is random, so it is `0x01` for ~1/256 of
-/// users — checking the version byte ALONE would misread those as encrypted
-/// and brick key loading. So we only treat a value as encrypted when its
-/// decoded length is not 64 AND the version byte is set.
-/// - hex-decode → if `len != 64` and first byte is `0x01`, decrypt with `dk`
-///   (error if `dk` is absent).
-/// - Otherwise, the stored string IS the plaintext hex key (legacy unencrypted).
-fn decrypt_stored_key(stored_value: &str, dk: Option<&[u8; 32]>) -> Result<String, YggmailError> {
-    use yggmail::storage::crypt::{VERSION_XCHACHA, aead_decrypt};
-    // Attempt hex-decode; if it fails the value is definitely not an encrypted blob.
-    if let Ok(bytes) = hex::decode(stored_value) {
-        // 64 bytes = legacy Ed25519 keypair; an encrypted blob is never 64 bytes.
-        if bytes.len() != 64 && bytes.first() == Some(&VERSION_XCHACHA) {
-            // Encrypted blob.
-            let dk = dk.ok_or_else(|| YggmailError::Config(
-                "private_key is encrypted but no data key available (wrong password?)".into(),
-            ))?;
-            let plaintext = aead_decrypt(dk, &bytes).ok_or_else(|| YggmailError::Config(
-                "private_key decryption failed — wrong key or corrupted blob".into(),
-            ))?;
-            return String::from_utf8(plaintext)
-                .map_err(|_| YggmailError::Config("decrypted private_key is not valid UTF-8".into()));
-        }
-    }
-    // Legacy plaintext: the stored value IS the hex key directly.
-    Ok(stored_value.to_string())
-}
-
-/// Persist the identity key to `mobile_config` (idempotent overwrite).
-///
-/// When `dk` is `Some`, the plaintext `hex_key` is encrypted before storage
-/// so the key never appears in plaintext in the DB.
-fn persist_identity(
-    conn: &rusqlite::Connection,
-    hex_key: &str,
-    dk: Option<&[u8; 32]>,
-) -> Result<(), YggmailError> {
-    use yggmail::storage::crypt::aead_encrypt;
-    let stored_value: String = if let Some(dk) = dk {
-        let encrypted_blob = aead_encrypt(dk, hex_key.as_bytes());
-        hex::encode(encrypted_blob)
-    } else {
-        hex_key.to_string()
-    };
-    conn.execute(
-        "INSERT OR REPLACE INTO mobile_config (key, value) VALUES ('private_key', ?1)",
-        rusqlite::params![stored_value],
-    )
-    .map_err(|e| YggmailError::Io(e.to_string()))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yggmail::storage::SqliteStorage;
+
+    // Открыть storage с паролем и вернуть выведенный data-key (DK).
+    // Storage дропается сразу — load_or_migrate_identity откроет свою connection,
+    // ровно как в start(): сперва open() минтит/распечатывает DK, затем identity.
+    fn dk_for(db: &str, password_hash: &str) -> Option<[u8; 32]> {
+        SqliteStorage::open(db, Some(password_hash))
+            .expect("storage open")
+            .at_rest_key
+    }
+
+    const PW_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const PW_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 
     fn temp_db(tag: &str) -> String {
-        let p = std::env::temp_dir().join(format!("yggmail-mobile-{}-{}.db", std::process::id(), tag));
+        let p =
+            std::env::temp_dir().join(format!("yggmail-mobile-{}-{}.db", std::process::id(), tag));
         let _ = std::fs::remove_file(&p);
         p.to_str().unwrap().to_string()
     }
@@ -733,13 +685,20 @@ mod tests {
         // In plaintext mode (dk=None) the stored value is the hex key verbatim.
         let conn = rusqlite::Connection::open(&p).unwrap();
         let persisted: String = conn
-            .query_row("SELECT value FROM mobile_config WHERE key = 'private_key'", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM mobile_config WHERE key = 'private_key'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(persisted, hex_key);
 
         // Idempotent: second call returns the same key.
         let (again, _) = load_or_migrate_identity(&p, None).unwrap();
-        assert_eq!(again.verifying_key().to_bytes(), key.verifying_key().to_bytes());
+        assert_eq!(
+            again.verifying_key().to_bytes(),
+            key.verifying_key().to_bytes()
+        );
 
         let _ = std::fs::remove_file(&p);
     }
@@ -785,9 +744,16 @@ mod tests {
         // In plaintext mode (dk=None) the stored value is the hex key verbatim.
         let conn = rusqlite::Connection::open(&p).unwrap();
         let persisted: String = conn
-            .query_row("SELECT value FROM mobile_config WHERE key = 'private_key'", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM mobile_config WHERE key = 'private_key'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(persisted, real_hex, "poisoned mobile_config must be overwritten with the real key");
+        assert_eq!(
+            persisted, real_hex,
+            "poisoned mobile_config must be overwritten with the real key"
+        );
 
         let _ = std::fs::remove_file(&p);
     }
@@ -804,12 +770,197 @@ mod tests {
         );
         let _ = std::fs::remove_file(&p);
     }
+
+    #[test]
+    fn encrypted_identity_roundtrips() {
+        let p = temp_db("enc-roundtrip");
+
+        // Первый "старт": open минтит DK, load генерит+шифрует identity в mobile_config.
+        let dk = dk_for(&p, PW_A);
+        assert!(dk.is_some(), "password → DK must be present");
+        let (k1, hex1) = load_or_migrate_identity(&p, dk.as_ref()).unwrap();
+
+        // Хранимое значение — зашифрованный блоб, НЕ 128-hex plaintext keypair.
+        let conn = rusqlite::Connection::open(&p).unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT value FROM mobile_config WHERE key = 'private_key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let raw = hex::decode(&stored).expect("stored value is hex");
+        assert_ne!(raw.len(), 64, "encrypted blob must not be a 64-byte keypair");
+        assert_eq!(raw.first(), Some(&0x01u8), "encrypted blob starts with VERSION_XCHACHA");
+        assert_ne!(stored, hex1, "stored form must be ciphertext, not plaintext hex");
+
+        // Второй load с тем же DK возвращает тот же адрес (расшифровка сработала).
+        let (k2, _) = load_or_migrate_identity(&p, dk.as_ref()).unwrap();
+        assert_eq!(
+            k1.verifying_key().to_bytes(),
+            k2.verifying_key().to_bytes(),
+            "encrypted identity must round-trip to the same @yggmail address"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn encrypted_identity_stable_across_restarts() {
+        let p = temp_db("enc-restarts");
+
+        // Первый старт фиксирует адрес.
+        let first = {
+            let dk = dk_for(&p, PW_A);
+            let (k, _) = load_or_migrate_identity(&p, dk.as_ref()).unwrap();
+            k.verifying_key().to_bytes()
+        };
+
+        // Ещё 5 "рестартов": каждый заново открывает storage (распечатывает тот же DK
+        // из wrapped_dk) и загружает identity. Адрес обязан остаться прежним.
+        for i in 0..5 {
+            let dk = dk_for(&p, PW_A);
+            let (k, _) = load_or_migrate_identity(&p, dk.as_ref()).unwrap();
+            assert_eq!(
+                k.verifying_key().to_bytes(),
+                first,
+                "restart #{i} rotated the @yggmail address — issue #39 regression"
+            );
+        }
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn wrong_password_errors_and_never_rotates_identity() {
+        let p = temp_db("enc-wrongpw");
+
+        // Установить identity под паролем A.
+        let original = {
+            let dk = dk_for(&p, PW_A);
+            let (k, _) = load_or_migrate_identity(&p, dk.as_ref()).unwrap();
+            k.verifying_key().to_bytes()
+        };
+
+        // Открытие под НЕВЕРНЫМ паролем B → hard error (DK не распечатывается),
+        // wrapped_dk НЕ перезаписывается новым ключом.
+        let bad = SqliteStorage::open(&p, Some(PW_B));
+        assert!(bad.is_err(), "wrong password must fail open, never mint a new DK");
+
+        // Возврат к верному паролю A → тот же DK, тот же адрес (ничего не потеряно).
+        let dk = dk_for(&p, PW_A);
+        let (k, _) = load_or_migrate_identity(&p, dk.as_ref()).unwrap();
+        assert_eq!(
+            k.verifying_key().to_bytes(),
+            original,
+            "correct password must recover the exact same @yggmail address"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn password_change_preserves_identity_address() {
+        let p = temp_db("enc-rewrap");
+
+        // Identity под паролем A.
+        let (before, before_hex) = {
+            let dk = dk_for(&p, PW_A);
+            load_or_migrate_identity(&p, dk.as_ref()).unwrap()
+        };
+
+        // Смена пароля A→B: тот же DK перезаворачивается под KEK(B). Identity/mail не трогаются.
+        {
+            let s = SqliteStorage::open(&p, Some(PW_A)).unwrap();
+            s.rewrap_data_key(PW_B).unwrap();
+        }
+
+        // Теперь открытие под НОВЫМ паролем B распечатывает тот же DK → тот же адрес.
+        let dk_b = dk_for(&p, PW_B);
+        let (after, after_hex) = load_or_migrate_identity(&p, dk_b.as_ref()).unwrap();
+        assert_eq!(
+            after_hex, before_hex,
+            "rewrap must preserve the exact keypair hex — same DK, not a re-mint"
+        );
+        assert_eq!(
+            after.verifying_key().to_bytes(),
+            before.verifying_key().to_bytes(),
+            "password change must preserve the @yggmail address (restore-under-new-password path)"
+        );
+
+        // И старый пароль A после rewrap больше не открывает БД (обёртка сменилась).
+        assert!(
+            SqliteStorage::open(&p, Some(PW_A)).is_err(),
+            "old password must stop working after rewrap"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn legacy_migration_under_encryption_heals_and_encrypts() {
+        let p = temp_db("enc-legacy");
+
+        // 1.8 DB: легаси `config` держит реальный ключ; сначала создаём его.
+        let real = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let real_hex = hex::encode(real.to_keypair_bytes());
+        {
+            let conn = rusqlite::Connection::open(&p).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE config (key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(key));",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO config (key, value) VALUES ('private_key', ?1)",
+                rusqlite::params![&real_hex],
+            )
+            .unwrap();
+        }
+
+        // Открытие storage с паролем создаёт at_rest/DK поверх той же БД.
+        let dk = dk_for(&p, PW_A);
+        let (loaded, loaded_hex) = load_or_migrate_identity(&p, dk.as_ref()).unwrap();
+
+        // Легаси-адрес сохранён.
+        assert_eq!(
+            loaded.verifying_key().to_bytes(),
+            real.verifying_key().to_bytes(),
+            "1.8→1.9 migration must keep the @yggmail address under encryption"
+        );
+        assert_eq!(loaded_hex, real_hex);
+
+        // mobile_config вылечен И зашифрован (не 64-байтный plaintext keypair).
+        let conn = rusqlite::Connection::open(&p).unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT value FROM mobile_config WHERE key = 'private_key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let raw = hex::decode(&stored).expect("mobile_config stored value must be hex-encoded ciphertext");
+        assert_eq!(raw.first(), Some(&0x01u8), "healed mobile_config must be encrypted");
+        assert_ne!(stored, real_hex, "must not store legacy key in plaintext");
+
+        // Следующий старт под тем же паролем даёт тот же адрес.
+        let dk2 = dk_for(&p, PW_A);
+        let (again, _) = load_or_migrate_identity(&p, dk2.as_ref()).unwrap();
+        assert_eq!(
+            again.verifying_key().to_bytes(),
+            real.verifying_key().to_bytes(),
+            "second load under same password must return the original legacy address"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
 }
 
 fn extract_header(raw: &[u8], name: &str) -> Option<String> {
     let text = String::from_utf8_lossy(raw);
     for line in text.lines() {
-        if line.is_empty() { break; }
+        if line.is_empty() {
+            break;
+        }
         if let Some(val) = line.strip_prefix(name) {
             return Some(val.trim().to_string());
         }

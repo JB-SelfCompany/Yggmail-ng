@@ -44,7 +44,11 @@ struct Session {
 }
 
 impl Session {
-    fn new(storage: Arc<SqliteStorage>, local_key: [u8; 32], password_hash: Option<String>) -> Self {
+    fn new(
+        storage: Arc<SqliteStorage>,
+        local_key: [u8; 32],
+        password_hash: Option<String>,
+    ) -> Self {
         Self {
             state: State::ExpectHelo,
             from: None,
@@ -63,7 +67,11 @@ impl Session {
                 // Allowed at any point (clients re-EHLO after AUTH to get capabilities).
                 self.from = None;
                 self.rcpts.clear();
-                self.state = if self.authenticated { State::ExpectMail } else { State::ExpectAuth };
+                self.state = if self.authenticated {
+                    State::ExpectMail
+                } else {
+                    State::ExpectAuth
+                };
                 if l.starts_with("EHLO") {
                     if self.password_hash.is_some() {
                         "250-yggmail-ng Hello\r\n250 AUTH LOGIN\r\n"
@@ -117,9 +125,7 @@ impl Session {
                 self.state = State::ReceivingData;
                 "354 Start mail input; end with <CRLF>.<CRLF>\r\n"
             }
-            "QUIT" => {
-                "221 Bye\r\n"
-            }
+            "QUIT" => "221 Bye\r\n",
             "RSET" => {
                 self.from = None;
                 self.rcpts.clear();
@@ -132,7 +138,11 @@ impl Session {
     }
 
     /// Process a dot-terminated mail body: store in Outbox + enqueue.
-    async fn accept_mail(&mut self, body: &str, writer: &mut BufWriter<tokio::net::tcp::OwnedWriteHalf>) {
+    async fn accept_mail(
+        &mut self,
+        body: &str,
+        writer: &mut BufWriter<tokio::net::tcp::OwnedWriteHalf>,
+    ) {
         let from = match self.from.as_ref() {
             Some(f) => f.clone(),
             None => {
@@ -161,16 +171,21 @@ impl Session {
         for rcpt in &self.rcpts {
             if let Some(dest_key) = parse_address(rcpt) {
                 let dest_hex = hex::encode(dest_key);
-                if let Err(e) = self.storage.queue_insert(
-                    &dest_hex, "Outbox", id, &from, rcpt,
-                ) {
+                if let Err(e) = self
+                    .storage
+                    .queue_insert(&dest_hex, "Outbox", id, &from, rcpt)
+                {
                     tracing::error!("SMTP: failed to enqueue for {}: {}", rcpt, e);
                 }
             }
         }
 
         let _ = writer.write_all(b"250 OK\r\n").await;
-        tracing::info!("SMTP: queued mail from {} to {} recipients", from, self.rcpts.len());
+        tracing::info!(
+            "SMTP: queued mail from {} to {} recipients",
+            from,
+            self.rcpts.len()
+        );
 
         self.from = None;
         self.rcpts.clear();
@@ -183,8 +198,15 @@ impl Session {
 fn extract_addr(line: &str, prefix: &str) -> Option<String> {
     let rest = line[prefix.len()..].trim();
     // Strip angle brackets if present
-    let addr = rest.strip_prefix('<').and_then(|s| s.strip_suffix('>')).unwrap_or(rest);
-    if addr.is_empty() { None } else { Some(addr.to_string()) }
+    let addr = rest
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(rest);
+    if addr.is_empty() {
+        None
+    } else {
+        Some(addr.to_string())
+    }
 }
 
 /// Minimal RFC 2822 timestamp string for Date/Received headers.
@@ -205,8 +227,7 @@ fn chrono_now() -> String {
     const SECS_PER_DAY: u64 = 86400;
     const DOW: &[&str] = &["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
     const MONTHS: &[&str] = &[
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
     // Unix epoch = Thu 1970-01-01 (day 4)
     let days = secs / SECS_PER_DAY;
@@ -228,7 +249,13 @@ fn chrono_now() -> String {
     let dow_idx = ((days + 4) % 7) as usize;
     format!(
         "{}, {:02} {} {} {:02}:{:02}:{:02} +0000",
-        DOW[dow_idx], d, MONTHS[month as usize - 1], year, h, m, s
+        DOW[dow_idx],
+        d,
+        MONTHS[month as usize - 1],
+        year,
+        h,
+        m,
+        s
     )
 }
 
@@ -348,7 +375,11 @@ pub async fn handle_conn(
             } else {
                 // Handle dot-stuffing: RFC 5321 §4.5.2 — only strip leading dot if line starts with ".."
                 // Single "." followed by CRLF is the DATA terminator (already handled above)
-                let stripped = if line.starts_with("..") { &line[1..] } else { &line[..] };
+                let stripped = if line.starts_with("..") {
+                    &line[1..]
+                } else {
+                    &line[..]
+                };
                 // Guard against unbounded accumulation before the dot-terminator.
                 if data_buf.len() + stripped.len() > MAX_DATA_BYTES {
                     writer.write_all(b"552 Message too large\r\n").await?;
@@ -370,8 +401,13 @@ pub async fn handle_conn(
             // Step 2: read username (ignored — local key verifies identity, not username)
             line.clear();
             {
-                let n = (&mut reader).take(MAX_LINE_BYTES as u64).read_line(&mut line).await?;
-                if n == 0 { break; }
+                let n = (&mut reader)
+                    .take(MAX_LINE_BYTES as u64)
+                    .read_line(&mut line)
+                    .await?;
+                if n == 0 {
+                    break;
+                }
                 if line.len() >= MAX_LINE_BYTES && !line.ends_with('\n') {
                     writer.write_all(b"500 Line too long\r\n").await?;
                     writer.flush().await?;
@@ -386,8 +422,13 @@ pub async fn handle_conn(
             // Step 4: read base64-encoded password and verify
             line.clear();
             {
-                let n = (&mut reader).take(MAX_LINE_BYTES as u64).read_line(&mut line).await?;
-                if n == 0 { break; }
+                let n = (&mut reader)
+                    .take(MAX_LINE_BYTES as u64)
+                    .read_line(&mut line)
+                    .await?;
+                if n == 0 {
+                    break;
+                }
                 if line.len() >= MAX_LINE_BYTES && !line.ends_with('\n') {
                     writer.write_all(b"500 Line too long\r\n").await?;
                     writer.flush().await?;
@@ -411,7 +452,9 @@ pub async fn handle_conn(
             if ok {
                 session.authenticated = true;
                 session.state = State::ExpectMail;
-                writer.write_all(b"235 Authentication successful\r\n").await?;
+                writer
+                    .write_all(b"235 Authentication successful\r\n")
+                    .await?;
             } else {
                 writer.write_all(b"535 Authentication failed\r\n").await?;
             }
@@ -438,7 +481,11 @@ mod tests {
 
     fn temp_db(name: &str) -> SqliteStorage {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("yggmail_smtp_test_{}_{}.db", std::process::id(), name));
+        let path = dir.join(format!(
+            "yggmail_smtp_test_{}_{}.db",
+            std::process::id(),
+            name
+        ));
         let _ = std::fs::remove_file(&path);
         SqliteStorage::open(&path.to_string_lossy(), None).unwrap()
     }
@@ -459,7 +506,9 @@ mod tests {
         });
 
         // Connect as SMTP client
-        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
         let mut buf = vec![0u8; 1024];
 
         // Read greeting
@@ -473,13 +522,19 @@ mod tests {
 
         // MAIL FROM
         let from = crate::address::create_address(&local_key);
-        stream.write_all(format!("MAIL FROM:<{}>\r\n", from).as_bytes()).await.unwrap();
+        stream
+            .write_all(format!("MAIL FROM:<{}>\r\n", from).as_bytes())
+            .await
+            .unwrap();
         let n = stream.read(&mut buf).await.unwrap();
         assert!(buf[..n].starts_with(b"250 "), "expected 250 MAIL FROM");
 
         // RCPT TO
         let bob = crate::address::create_address(&[0x99u8; 32]);
-        stream.write_all(format!("RCPT TO:<{}>\r\n", bob).as_bytes()).await.unwrap();
+        stream
+            .write_all(format!("RCPT TO:<{}>\r\n", bob).as_bytes())
+            .await
+            .unwrap();
         let n = stream.read(&mut buf).await.unwrap();
         assert!(buf[..n].starts_with(b"250 "), "expected 250 RCPT TO");
 

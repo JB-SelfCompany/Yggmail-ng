@@ -76,7 +76,12 @@ pub enum PktType {
 impl SegmentHeader {
     /// Encode this header into a buffer (must be at least [`HEADER_SIZE`] bytes).
     pub fn encode(&self, out: &mut [u8]) {
-        debug_assert!(out.len() >= HEADER_SIZE, "encode buffer too short: {} < {}", out.len(), HEADER_SIZE);
+        debug_assert!(
+            out.len() >= HEADER_SIZE,
+            "encode buffer too short: {} < {}",
+            out.len(),
+            HEADER_SIZE
+        );
         out[0] = match self.pkt_type {
             PktType::Data => PKT_DATA,
             PktType::Ack => PKT_ACK,
@@ -106,27 +111,57 @@ impl SegmentHeader {
         let seq = u16::from_be_bytes(buf[9..11].try_into().unwrap());
         let total = u16::from_be_bytes(buf[11..13].try_into().unwrap());
         let payload_len = u16::from_be_bytes(buf[13..15].try_into().unwrap());
-        Some(Self { pkt_type, msg_id, seq, total, payload_len })
+        Some(Self {
+            pkt_type,
+            msg_id,
+            seq,
+            total,
+            payload_len,
+        })
     }
 
     /// Build a DATA header for one segment of a fragmented message.
     pub fn data(msg_id: MessageId, seq: u16, total: u16, payload_len: u16) -> Self {
-        Self { pkt_type: PktType::Data, msg_id, seq, total, payload_len }
+        Self {
+            pkt_type: PktType::Data,
+            msg_id,
+            seq,
+            total,
+            payload_len,
+        }
     }
 
     /// Build an ACK header for a received segment.
     pub fn ack(msg_id: MessageId, seq: u16) -> Self {
-        Self { pkt_type: PktType::Ack, msg_id, seq, total: 0, payload_len: 0 }
+        Self {
+            pkt_type: PktType::Ack,
+            msg_id,
+            seq,
+            total: 0,
+            payload_len: 0,
+        }
     }
 
     /// Build a SYN header for connection handshake.
     pub fn syn(msg_id: MessageId) -> Self {
-        Self { pkt_type: PktType::Syn, msg_id, seq: 0, total: 0, payload_len: 0 }
+        Self {
+            pkt_type: PktType::Syn,
+            msg_id,
+            seq: 0,
+            total: 0,
+            payload_len: 0,
+        }
     }
 
     /// Build a SYN-ACK header for handshake response.
     pub fn syn_ack(msg_id: MessageId) -> Self {
-        Self { pkt_type: PktType::SynAck, msg_id, seq: 0, total: 0, payload_len: 0 }
+        Self {
+            pkt_type: PktType::SynAck,
+            msg_id,
+            seq: 0,
+            total: 0,
+            payload_len: 0,
+        }
     }
 }
 

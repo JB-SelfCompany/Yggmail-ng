@@ -11,17 +11,17 @@
 
 mod types;
 
-pub use types::{MessageId, SegmentHeader, YmpError, HEADER_SIZE, FRAGMENT_SIZE};
+pub use types::{FRAGMENT_SIZE, HEADER_SIZE, MessageId, SegmentHeader, YmpError};
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ironwood::types::{Addr, PacketConn};
-use tokio::sync::{mpsc, Mutex, Notify};
-use tokio::time::{timeout, Duration, Instant};
+use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::time::{Duration, Instant, timeout};
 use types::{
-    PktType, MAX_MESSAGE_SIZE, MAX_RETRIES, MAX_SYN_RETRIES, REASSEMBLY_TIMEOUT_SECS,
+    MAX_MESSAGE_SIZE, MAX_RETRIES, MAX_SYN_RETRIES, PktType, REASSEMBLY_TIMEOUT_SECS,
     RETRY_TIMEOUT_SECS, SYN_TIMEOUT_SECS,
 };
 
@@ -91,7 +91,7 @@ pub struct YmpSession {
     /// warm (ironwood expires cached paths after ~60s), matching the Go keepalive.
     active_peers: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
     recv_rx: Mutex<mpsc::Receiver<([u8; 32], Vec<u8>)>>,
-    _recv_tx: mpsc::Sender<([u8; 32], Vec<u8>)>,  // kept alive to prevent channel close
+    _recv_tx: mpsc::Sender<([u8; 32], Vec<u8>)>, // kept alive to prevent channel close
     closed: AtomicBool,
     reader_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     cleanup_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -187,10 +187,13 @@ impl YmpSession {
         let syn_notify = Arc::new(Notify::new());
         {
             let mut syns = self.pending_syns.lock().await;
-            syns.insert(msg_id, PendingSyn {
-                notify: syn_notify.clone(),
-                expected_src: dest,
-            });
+            syns.insert(
+                msg_id,
+                PendingSyn {
+                    notify: syn_notify.clone(),
+                    expected_src: dest,
+                },
+            );
         }
 
         let syn_header = SegmentHeader::syn(msg_id);
@@ -201,7 +204,9 @@ impl YmpSession {
         for attempt in 0..MAX_SYN_RETRIES {
             tracing::debug!(
                 "ymp: SYN attempt {}/{} msg_id={} dest={}",
-                attempt + 1, MAX_SYN_RETRIES, msg_id,
+                attempt + 1,
+                MAX_SYN_RETRIES,
+                msg_id,
                 hex::encode(&dest[..8]),
             );
             // Re-warm the forward path each attempt — a lookup lost to a cold
@@ -211,7 +216,8 @@ impl YmpSession {
                 tracing::warn!("ymp: SYN write error: {e}");
             }
 
-            let wait_result = timeout(Duration::from_secs(SYN_TIMEOUT_SECS), syn_notify.notified()).await;
+            let wait_result =
+                timeout(Duration::from_secs(SYN_TIMEOUT_SECS), syn_notify.notified()).await;
             if wait_result.is_ok() {
                 syn_acked = true;
                 tracing::debug!("ymp: SYN-ACK received msg_id={}", msg_id);
@@ -229,7 +235,8 @@ impl YmpSession {
             // ~60s (MAX_RETRIES × RETRY_TIMEOUT_SECS) on DATA retries into the void.
             tracing::warn!(
                 "ymp: SYN handshake failed for msg_id={} to {} — peer unreachable",
-                msg_id, hex::encode(&dest[..8]),
+                msg_id,
+                hex::encode(&dest[..8]),
             );
             return Err(YmpError::Unreachable);
         }
@@ -252,24 +259,28 @@ impl YmpSession {
 
         // Transmit loop with retries
         for attempt in 0..MAX_RETRIES {
-            tracing::debug!("ymp: DATA send msg_id={} attempt={}/{} total_segments={} dest={}", msg_id, attempt + 1, MAX_RETRIES, total, hex::encode(&dest[..8]));
+            tracing::debug!(
+                "ymp: DATA send msg_id={} attempt={}/{} total_segments={} dest={}",
+                msg_id,
+                attempt + 1,
+                MAX_RETRIES,
+                total,
+                hex::encode(&dest[..8])
+            );
             // Send unacked segments — brief per-segment lock, write+stagger outside.
             for seq in 0..total {
                 let already_acked = {
                     let pending = self.pending.lock().await;
-                    pending.get(&msg_id)
+                    pending
+                        .get(&msg_id)
                         .map(|ps| ps.acked[seq as usize])
                         .unwrap_or(true) // entry gone → skip
                 };
                 if already_acked {
                     continue;
                 }
-                let header = SegmentHeader::data(
-                    msg_id,
-                    seq,
-                    total,
-                    segments[seq as usize].len() as u16,
-                );
+                let header =
+                    SegmentHeader::data(msg_id, seq, total, segments[seq as usize].len() as u16);
                 let mut packet = Vec::with_capacity(HEADER_SIZE + segments[seq as usize].len());
                 packet.resize(HEADER_SIZE, 0);
                 header.encode(&mut packet[..HEADER_SIZE]);
@@ -277,7 +288,13 @@ impl YmpSession {
                 if let Err(e) = self.inner.write_to(&packet, &addr).await {
                     tracing::warn!("ymp: DATA write error msg_id={} seq={}: {e}", msg_id, seq);
                 } else {
-                    tracing::trace!("ymp: DATA write ok msg_id={} seq={}/{} size={}", msg_id, seq, total, packet.len());
+                    tracing::trace!(
+                        "ymp: DATA write ok msg_id={} seq={}/{} size={}",
+                        msg_id,
+                        seq,
+                        total,
+                        packet.len()
+                    );
                 }
                 // ponytail: burst-bound, don't pace every segment. write_to
                 // silent-drops excess beyond the DRR per-flow cap, so we cap a
@@ -371,7 +388,10 @@ fn fragment(message: &[u8], total: u16) -> Vec<Vec<u8>> {
 }
 
 fn reassemble(segments: &[Option<Vec<u8>>]) -> Vec<u8> {
-    let total_len: usize = segments.iter().map(|s| s.as_ref().map_or(0, |v| v.len())).sum();
+    let total_len: usize = segments
+        .iter()
+        .map(|s| s.as_ref().map_or(0, |v| v.len()))
+        .sum();
     let mut out = Vec::with_capacity(total_len);
     for seg in segments {
         if let Some(data) = seg {
@@ -417,7 +437,11 @@ async fn reader_loop(
         if n < HEADER_SIZE {
             // debug, not info: a peer on the old (pre-1.9.0) wire protocol streams
             // packets we can't parse — harmless, dropped, but must not spam logs.
-            tracing::debug!("ymp: short packet n={} from {}", n, hex::encode(&from_addr.0[..8]));
+            tracing::debug!(
+                "ymp: short packet n={} from {}",
+                n,
+                hex::encode(&from_addr.0[..8])
+            );
             continue;
         }
 
@@ -428,7 +452,8 @@ async fn reader_loop(
                 // we drop it silently rather than flooding the log at info level.
                 tracing::debug!(
                     "ymp: bad header byte={:#x} head={:02x?} from {}",
-                    buf[0], &buf[..16.min(n)],
+                    buf[0],
+                    &buf[..16.min(n)],
                     hex::encode(&from_addr.0[..8]),
                 );
                 continue;
@@ -436,11 +461,18 @@ async fn reader_loop(
         };
 
         // Record inbound peer for the path-warmer (keep its Yggdrasil path warm).
-        active_peers.lock().await.insert(from_addr.0, Instant::now());
+        active_peers
+            .lock()
+            .await
+            .insert(from_addr.0, Instant::now());
 
         tracing::trace!(
             "ymp: {:?} msg_id={} seq={}/{} len={} from {}",
-            header.pkt_type, header.msg_id, header.seq, header.total, header.payload_len,
+            header.pkt_type,
+            header.msg_id,
+            header.seq,
+            header.total,
+            header.payload_len,
             hex::encode(&from_addr.0[..8]),
         );
 
@@ -460,7 +492,9 @@ async fn reader_loop(
                             throttle.insert(from_addr.0, now);
                             // ponytail: prune old entries occasionally to bound map size.
                             if throttle.len() > 256 {
-                                throttle.retain(|_, t| now.duration_since(*t) < SYN_THROTTLE_INTERVAL * 4);
+                                throttle.retain(|_, t| {
+                                    now.duration_since(*t) < SYN_THROTTLE_INTERVAL * 4
+                                });
                             }
                             true
                         }
@@ -503,7 +537,10 @@ async fn reader_loop(
                 if payload.len() != header.payload_len as usize {
                     tracing::info!(
                         "ymp: DATA drop (length mismatch) msg_id={} seq={} payload_len={} header_len={} from {}",
-                        header.msg_id, header.seq, payload.len(), header.payload_len,
+                        header.msg_id,
+                        header.seq,
+                        payload.len(),
+                        header.payload_len,
                         hex::encode(&from_addr.0[..8]),
                     );
                     continue; // length mismatch
@@ -513,7 +550,9 @@ async fn reader_loop(
                 if header.seq >= header.total || header.total == 0 {
                     tracing::info!(
                         "ymp: DATA drop (invalid seq/total) msg_id={} seq={} total={} from {}",
-                        header.msg_id, header.seq, header.total,
+                        header.msg_id,
+                        header.seq,
+                        header.total,
                         hex::encode(&from_addr.0[..8]),
                     );
                     continue;
@@ -522,7 +561,10 @@ async fn reader_loop(
                 if total_data > MAX_MESSAGE_SIZE {
                     tracing::info!(
                         "ymp: DATA drop (too large) msg_id={} seq={} total_data={} max={} from {}",
-                        header.msg_id, header.seq, total_data, MAX_MESSAGE_SIZE,
+                        header.msg_id,
+                        header.seq,
+                        total_data,
+                        MAX_MESSAGE_SIZE,
                         hex::encode(&from_addr.0[..8]),
                     );
                     continue;
@@ -545,10 +587,8 @@ async fn reader_loop(
                 // entries for this (msg_id, peer) pair are left untouched).
                 if !reasm.contains_key(&key) && reasm.len() >= MAX_REASSEMBLY_BUFFERS {
                     // Evict the oldest buffer by creation time.
-                    if let Some(oldest_key) = reasm
-                        .iter()
-                        .min_by_key(|(_, b)| b.created)
-                        .map(|(k, _)| *k)
+                    if let Some(oldest_key) =
+                        reasm.iter().min_by_key(|(_, b)| b.created).map(|(k, _)| *k)
                     {
                         reasm.remove(&oldest_key);
                         tracing::debug!(
@@ -558,14 +598,12 @@ async fn reader_loop(
                         );
                     }
                 }
-                let entry = reasm
-                    .entry(key)
-                    .or_insert_with(|| ReassemblyBuffer {
-                        total: header.total,
-                        segments: vec![None; header.total as usize],
-                        received: 0,
-                        created: Instant::now(),
-                    });
+                let entry = reasm.entry(key).or_insert_with(|| ReassemblyBuffer {
+                    total: header.total,
+                    segments: vec![None; header.total as usize],
+                    received: 0,
+                    created: Instant::now(),
+                });
 
                 if entry.segments[header.seq as usize].is_none() {
                     entry.segments[header.seq as usize] = Some(payload.to_vec());
@@ -579,7 +617,8 @@ async fn reader_loop(
                     drop(reasm);
                     tracing::info!(
                         "ymp: reassembly complete msg_id={}, delivering {} bytes to receiver",
-                        header.msg_id, data.len()
+                        header.msg_id,
+                        data.len()
                     );
                     if recv_tx.send((from_key, data)).await.is_err() {
                         tracing::error!("ymp: recv_tx send failed, reader_loop exiting");
@@ -634,12 +673,18 @@ mod tests {
             let (tx_a, rx_b) = mpsc::unbounded_channel();
             let (tx_b, rx_a) = mpsc::unbounded_channel();
             let a = Arc::new(Self {
-                tx: tx_a, rx: Mutex::new(rx_a),
-                closed: AtomicBool::new(false), signing_key: key_a, local_addr: addr_a,
+                tx: tx_a,
+                rx: Mutex::new(rx_a),
+                closed: AtomicBool::new(false),
+                signing_key: key_a,
+                local_addr: addr_a,
             });
             let b = Arc::new(Self {
-                tx: tx_b, rx: Mutex::new(rx_b),
-                closed: AtomicBool::new(false), signing_key: key_b, local_addr: addr_b,
+                tx: tx_b,
+                rx: Mutex::new(rx_b),
+                closed: AtomicBool::new(false),
+                signing_key: key_b,
+                local_addr: addr_b,
             });
             (a, b)
         }
@@ -664,15 +709,28 @@ mod tests {
             Ok(buf.len())
         }
 
-        async fn handle_conn(&self, _key: Addr, _conn: Box<dyn AsyncConn>, _prio: u8) -> IwResult<()> {
+        async fn handle_conn(
+            &self,
+            _key: Addr,
+            _conn: Box<dyn AsyncConn>,
+            _prio: u8,
+        ) -> IwResult<()> {
             Ok(())
         }
 
-        fn is_closed(&self) -> bool { self.closed.load(Ordering::Relaxed) }
-        fn private_key(&self) -> &SigningKey { &self.signing_key }
-        fn mtu(&self) -> u64 { 65535 }
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::Relaxed)
+        }
+        fn private_key(&self) -> &SigningKey {
+            &self.signing_key
+        }
+        fn mtu(&self) -> u64 {
+            65535
+        }
         async fn send_lookup(&self, _target: Addr) {}
-        fn local_addr(&self) -> Addr { self.local_addr }
+        fn local_addr(&self) -> Addr {
+            self.local_addr
+        }
 
         async fn close(&self) -> IwResult<()> {
             self.closed.store(true, Ordering::Relaxed);
@@ -795,18 +853,33 @@ mod tests {
             Ok(buf.len())
         }
 
-        async fn handle_conn(&self, _key: Addr, _conn: Box<dyn AsyncConn>, _prio: u8) -> IwResult<()> {
+        async fn handle_conn(
+            &self,
+            _key: Addr,
+            _conn: Box<dyn AsyncConn>,
+            _prio: u8,
+        ) -> IwResult<()> {
             Ok(())
         }
 
-        fn is_closed(&self) -> bool { false }
-        fn private_key(&self) -> &SigningKey { &self.signing_key }
-        fn mtu(&self) -> u64 { 65535 }
+        fn is_closed(&self) -> bool {
+            false
+        }
+        fn private_key(&self) -> &SigningKey {
+            &self.signing_key
+        }
+        fn mtu(&self) -> u64 {
+            65535
+        }
         async fn send_lookup(&self, target: Addr) {
             self.lookups.lock().await.push(target.0);
         }
-        fn local_addr(&self) -> Addr { self.local_addr }
-        async fn close(&self) -> IwResult<()> { Ok(()) }
+        fn local_addr(&self) -> Addr {
+            self.local_addr
+        }
+        async fn close(&self) -> IwResult<()> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -874,7 +947,11 @@ mod tests {
         // Reader must record the inbound peer (bounded wait — never hangs).
         let mut found = false;
         for _ in 0..25 {
-            if session.recent_peers(Duration::from_secs(600)).await.contains(&peer) {
+            if session
+                .recent_peers(Duration::from_secs(600))
+                .await
+                .contains(&peer)
+            {
                 found = true;
                 break;
             }
@@ -883,7 +960,12 @@ mod tests {
         assert!(found, "reader must record inbound peer for path warming");
 
         // A zero-length window evicts everything.
-        assert!(session.recent_peers(Duration::from_millis(0)).await.is_empty());
+        assert!(
+            session
+                .recent_peers(Duration::from_millis(0))
+                .await
+                .is_empty()
+        );
     }
 
     // ── integration: YmpSession ↔ YmpSession ────────────────────────────
