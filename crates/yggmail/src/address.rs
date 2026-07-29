@@ -2,6 +2,10 @@
 //! ponytail: port of yggmail_old/internal/utils/address.go.
 
 const DOMAIN: &str = "yggmail";
+/// Go-сторона принимает оба домена (`utils/address.go`: `DomainAlias`), алиас
+/// добавлен ради почтовых клиентов, которым нужен FQDN. Без него `MAIL FROM`
+/// от узла 1.8 с таким адресом отбивается с 550.
+const DOMAIN_ALIAS: &str = "yggmail.local";
 
 /// Build a yggmail address from an Ed25519 public key.
 pub fn create_address(pubkey: &[u8; 32]) -> String {
@@ -15,7 +19,8 @@ pub fn parse_address(email: &str) -> Option<[u8; 32]> {
     if at == 0 {
         return None;
     }
-    if !email[at + 1..].eq_ignore_ascii_case(DOMAIN) {
+    let domain = email[at + 1..].trim();
+    if !domain.eq_ignore_ascii_case(DOMAIN) && !domain.eq_ignore_ascii_case(DOMAIN_ALIAS) {
         return None;
     }
     let hex_part = &email[..at];
@@ -52,5 +57,32 @@ mod tests {
     #[test]
     fn short_hex() {
         assert!(parse_address("deadbeef@yggmail").is_none());
+    }
+
+    #[test]
+    fn accepts_local_domain_alias() {
+        let key = [0x42u8; 32];
+        let alias = format!("{}@yggmail.local", hex::encode(key));
+        assert_eq!(parse_address(&alias), Some(key));
+    }
+
+    #[test]
+    fn domain_match_is_case_insensitive() {
+        let key = [0x42u8; 32];
+        let upper = format!("{}@YGGMAIL.LOCAL", hex::encode(key));
+        assert_eq!(parse_address(&upper), Some(key));
+    }
+
+    #[test]
+    fn create_address_still_emits_canonical_domain() {
+        let addr = create_address(&[0x42u8; 32]);
+        assert!(addr.ends_with("@yggmail"), "got {addr}");
+    }
+
+    #[test]
+    fn near_miss_domains_are_rejected() {
+        let key = hex::encode([0x42u8; 32]);
+        assert!(parse_address(&format!("{key}@yggmail.localhost")).is_none());
+        assert!(parse_address(&format!("{key}@local")).is_none());
     }
 }
