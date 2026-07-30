@@ -24,6 +24,10 @@ async-trait = "0.1"
 # Почтовый QUIC-оверлей (quinn поверх mesh, вместо YMP). Версии уже сошлись
 # в дереве под фичей `quic` у yggdrasil, поэтому граф не разъезжается.
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+# Версия совпадает с уже разрешённой в дереве (через quinn/yggdrasil/imap-server),
+# новый код в граф не тянется — нужна только для `rustls::pki_types::CertificateDer`
+# при извлечении сертификата пира в quic/mod.rs.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
