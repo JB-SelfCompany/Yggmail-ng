@@ -59,17 +59,31 @@ impl CoreUdpSocket {
         tokio::spawn(async move {
             let mut buf = vec![0u8; RECV_BUF_BYTES];
             loop {
-                match recv_conn.read_from(&mut buf).await {
-                    Ok((n, from)) => {
-                        tracing::debug!("quic: datagram from {}", hex::encode(&from.0[..8]));
-                        let addr = recv_table.addr_for_key(from.0);
-                        if recv_tx.send((addr, buf[..n].to_vec())).is_err() {
-                            break; // сокет уничтожен
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("quic: udp recv pump exiting: {e:?}");
+                // Симметрично исходящему насосу: без этого select входящий
+                // насос замечает уничтоженный сокет только по следующей
+                // датаграмме (send в закрытый канал), а пока пир молчит —
+                // держит Arc<dyn PacketConn> вечно. На Android сервис
+                // многократно останавливается/стартует, так что такие
+                // задачи копятся одна за другим.
+                tokio::select! {
+                    _ = recv_tx.closed() => {
+                        tracing::debug!("quic: udp recv pump exiting: socket dropped");
                         break;
+                    }
+                    r = recv_conn.read_from(&mut buf) => {
+                        match r {
+                            Ok((n, from)) => {
+                                tracing::debug!("quic: datagram from {}", hex::encode(&from.0[..8]));
+                                let addr = recv_table.addr_for_key(from.0);
+                                if recv_tx.send((addr, buf[..n].to_vec())).is_err() {
+                                    break; // сокет уничтожен
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!("quic: udp recv pump exiting: {e:?}");
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -226,5 +240,58 @@ mod tests {
             src_ip: None,
         });
         assert!(res.is_err(), "unknown destination must error");
+    }
+
+    /// `poll_recv` должен отбрасывать датаграмму, не влезающую в буфер quinn,
+    /// а не обрезать её — обрезанный QUIC-пакет провалит расшифровку и будет
+    /// неотличим от потери сети. Большая датаграмма уходит первой, чтобы
+    /// путь дропа реально сработал прежде, чем придёт валидная.
+    #[tokio::test]
+    async fn poll_recv_drops_oversized_datagram_but_delivers_the_next() {
+        let ka = SigningKey::from_bytes(&[9u8; 32]);
+        let kb = SigningKey::from_bytes(&[10u8; 32]);
+        let (a, b) = MemPacketConn::pair(ka, kb);
+
+        let table = Arc::new(AddrTable::default());
+        let sock = CoreUdpSocket::new(a as Arc<dyn PacketConn>, table);
+
+        let big = vec![0xAAu8; 100];
+        b.write_to(&big, &Addr([0u8; 32])).await.unwrap();
+        b.write_to(&[0xC0, 0x77], &Addr([0u8; 32])).await.unwrap();
+
+        // quinn выделяет под poll_recv буфер на 8 байт: 100-байтовая
+        // датаграмма в него не влезает и обязана быть отброшена целиком.
+        let mut recv_buf = [0u8; 8];
+        let mut iov = [IoSliceMut::new(&mut recv_buf)];
+        let mut meta = [RecvMeta {
+            addr: "[::1]:0".parse().unwrap(),
+            len: 0,
+            stride: 0,
+            ecn: None,
+            dst_ip: None,
+        }];
+
+        let mut task = tokio_test::task::spawn(());
+        let mut result = None;
+        for _ in 0..200 {
+            let poll = task.enter(|cx, _| sock.poll_recv(cx, &mut iov, &mut meta));
+            match poll {
+                Poll::Ready(r) => {
+                    result = Some(r);
+                    break;
+                }
+                Poll::Pending => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+            }
+        }
+
+        let n = result
+            .expect("poll_recv must eventually become ready")
+            .expect("poll_recv must not error");
+        assert_eq!(n, 1);
+        assert_eq!(
+            &recv_buf[..meta[0].len],
+            &[0xC0, 0x77],
+            "oversized datagram must be dropped, not truncated into the buffer"
+        );
     }
 }
