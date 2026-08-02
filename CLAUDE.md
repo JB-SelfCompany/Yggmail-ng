@@ -85,6 +85,14 @@ Tables: `mails`, `mailboxes`, `queue`, `config`. Key details:
 - **Ponytail throughout.** Marked with `ponytail:` comments. Examples: no chrono crate (stdlib timestamps), no thiserror in yggmail (manual `impl Display`), encryption stubbed (version byte 0x00), writer channel skipped (rusqlite mutex is enough).
 - **Schema compatible with yggmail_old** for migration path.
 - **localhost-only** for SMTP/IMAP — rejects non-loopback connections at accept time.
+- **rustls форкнут** (`../rustls-yggmail`, подключён через `[patch.crates-io]` в
+  корневом `Cargo.toml`) ради одной строки: upstream отвечает фатальным алертом на
+  SNI от yggmail-go — одну 64-символьную DNS-метку, превышающую лимит в 63. Без
+  этого входящие соединения от узлов 1.8 невозможны. Безопасно именно здесь: SNI не
+  используется вообще (один сертификат, аутентификация по ed25519-ключу из
+  сертификата). **При обновлении rustls** несовпадение версии заставит cargo молча
+  проигнорировать patch — проверять `cargo tree -p yggmail -i rustls`. Подробности —
+  в комментарии над `[patch.crates-io]`.
 
 ## Testing patterns
 
