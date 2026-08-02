@@ -10,7 +10,10 @@
 
 mod addr_table;
 mod smtp_overlay;
+mod transport;
 mod udp_adapter;
+
+pub use transport::{QuicMailError, QuicMailTransport};
 
 use std::sync::Arc;
 use std::time::Duration;
