@@ -68,9 +68,29 @@ impl QuicMailTransport {
         });
 
         // Цикл приёма: соединение → стримы → серверный диалог → канал.
-        let accept_self = me.clone();
+        //
+        // Держать здесь сильный Arc<Self> сделало бы транспорт неубиваемым:
+        // единственный выход из цикла — overlay.accept(), возвращающий None,
+        // а это требует, чтобы Endpoint внутри QuicOverlay уже уронили, что
+        // не случится, пока эта задача держит на него сильную ссылку.
+        // Вместо AbortHandle/close()-метода цикл слушает тот же сигнал о
+        // смерти владельца, что и насос в udp_adapter.rs: closed() на
+        // отправителе канала, чей получатель живёт внутри Self. Когда Self
+        // роняют, recv_rx роняется вместе с ним, closed() срабатывает — и
+        // цикл выходит сам, отпуская overlay.
+        let weak_self = Arc::downgrade(&me);
         tokio::spawn(async move {
-            while let Some(incoming) = overlay.accept().await {
+            loop {
+                let incoming = tokio::select! {
+                    _ = recv_tx.closed() => {
+                        tracing::debug!("quic: accept loop exiting: transport dropped");
+                        break;
+                    }
+                    incoming = overlay.accept() => incoming,
+                };
+                let Some(incoming) = incoming else {
+                    break;
+                };
                 let connection = match incoming {
                     Ok(c) => c,
                     Err(e) => {
@@ -87,10 +107,15 @@ impl QuicMailTransport {
                     continue;
                 };
                 tracing::info!("quic: handshake ok peer={}", hex::encode(&pk[..8]));
-                accept_self.note_active(pk).await;
+                let Some(strong_self) = weak_self.upgrade() else {
+                    tracing::debug!("quic: accept loop exiting: transport dropped");
+                    break;
+                };
+                strong_self.note_active(pk).await;
+                let local_key = strong_self.local_key;
+                drop(strong_self);
 
                 let tx = recv_tx.clone();
-                let local_key = accept_self.local_key;
                 tokio::spawn(async move {
                     loop {
                         let (send, recv) = match connection.accept_bi().await {
@@ -190,6 +215,16 @@ impl QuicMailTransport {
         self.conns.try_lock().map(|g| g.len()).unwrap_or(0)
     }
 
+    /// `stable_id()` закэшированного соединения к `dest` (для тестов).
+    ///
+    /// Количество записей в кэше не отличает переиспользование соединения от
+    /// передозвона, перезаписавшего тот же слот — `stable_id()` уникален на
+    /// процесс, поэтому равенство двух id доказывает именно переиспользование.
+    #[cfg(test)]
+    pub(crate) async fn cached_connection_stable_id(&self, dest: [u8; 32]) -> Option<usize> {
+        self.conns.lock().await.get(&dest).map(|c| c.stable_id())
+    }
+
     async fn connection_for(&self, dest: [u8; 32]) -> Result<Connection, QuicMailError> {
         {
             let cache = self.conns.lock().await;
@@ -215,7 +250,20 @@ impl QuicMailTransport {
                 ));
             }
         }
-        self.conns.lock().await.insert(dest, c.clone());
+        // Дозвон шёл без лока (иначе дозвоны к разным пирам сериализовались
+        // бы друг за другом), так что конкурентный send() к тому же пиру мог
+        // успеть вставить своё соединение первым. Двойная проверка перед
+        // вставкой не даёт двум живым соединениям на одного пира разойтись:
+        // проигравшее закрывается сразу, а не висит до 30-минутного
+        // idle-таймаута, будучи уже недостижимым из кэша.
+        let mut cache = self.conns.lock().await;
+        if let Some(existing) = cache.get(&dest) {
+            if existing.close_reason().is_none() {
+                c.close(0u32.into(), b"duplicate connection, using cached");
+                return Ok(existing.clone());
+            }
+        }
+        cache.insert(dest, c.clone());
         Ok(c)
     }
 
@@ -291,10 +339,23 @@ mod tests {
 
         alice.send(pub_b, b"Subject: one\r\n\r\n1\r\n".to_vec()).await.unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(10), bob.recv()).await.unwrap();
+        let first_id = alice
+            .cached_connection_stable_id(pub_b)
+            .await
+            .expect("connection cached after first send");
+
         alice.send(pub_b, b"Subject: two\r\n\r\n2\r\n".to_vec()).await.unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(10), bob.recv()).await.unwrap();
+        let second_id = alice
+            .cached_connection_stable_id(pub_b)
+            .await
+            .expect("connection cached after second send");
 
         assert_eq!(alice.cached_connection_count(), 1, "one cached connection per peer");
+        assert_eq!(
+            first_id, second_id,
+            "second send must reuse the cached QUIC connection, not redial"
+        );
     }
 
     /// Недавно активные пиры видны прогревателю путей.
