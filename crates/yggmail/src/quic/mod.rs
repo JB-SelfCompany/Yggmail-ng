@@ -9,6 +9,7 @@
 //! подключается к хабу, рядом с `tcp://`), он `pub(crate)` и не переиспользуется.
 
 mod addr_table;
+mod smtp_overlay;
 mod udp_adapter;
 
 use std::sync::Arc;
