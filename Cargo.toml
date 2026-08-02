@@ -2,6 +2,13 @@
 resolver = "2"
 members = ["crates/yggmail", "crates/yggmail-mobile"]
 
+# rustls форкнут ради одной строки: upstream рвёт handshake фатальным алертом на
+# SNI от yggmail-go (одна 64-символьная метка > лимита DNS в 63). Подробности и
+# обоснование — в комментарии к правке в server/hs.rs. Патч распространяется на
+# весь граф сборки, включая rustls внутри Yggdrasil-ng.
+[patch.crates-io]
+rustls = { path = "../rustls-yggmail" }
+
 [profile.release]
 opt-level = 3
 lto = true
