@@ -239,7 +239,15 @@ mod tests {
             .unwrap();
         let _ = smtp.read(&mut buf).await.unwrap();
 
-        smtp.write_all(b"RCPT TO:<bob@yggmail>\r\n").await.unwrap();
+        // Настоящий yggmail-адрес, а не "bob@yggmail". Раньше здесь стоял
+        // неразбираемый адрес, и тест проходил лишь потому, что SMTP молча
+        // выбрасывал такого получателя, оставляя письмо в Outbox: то есть
+        // тест закреплял ровно то поведение молчаливой воронки, из-за которого
+        // почта исчезала без следа в логе.
+        let bob = yggmail::address::create_address(&[0x99u8; 32]);
+        smtp.write_all(format!("RCPT TO:<{}>\r\n", bob).as_bytes())
+            .await
+            .unwrap();
         let _ = smtp.read(&mut buf).await.unwrap();
 
         smtp.write_all(b"DATA\r\n").await.unwrap();

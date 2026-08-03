@@ -168,24 +168,48 @@ impl Session {
             }
         };
 
+        // Каждый получатель обязан попасть в очередь. Раньше неразобранный
+        // адрес молча выбрасывался, письмо оставалось в Outbox, клиент получал
+        // 250 OK, а лог считал self.rcpts.len() и рапортовал успех — письмо
+        // исчезало без единой строки в логе (sender видит пустой список
+        // назначений и выходит молча). Go на этом месте валит DATA целиком
+        // (`smtpsender/sender.go`, QueueFor возвращает ошибку), и это
+        // правильное поведение: клиент должен узнать, что письмо не уйдёт.
+        let mut queued = 0usize;
         for rcpt in &self.rcpts {
-            if let Some(dest_key) = parse_address(rcpt) {
-                let dest_hex = hex::encode(dest_key);
-                if let Err(e) = self
-                    .storage
-                    .queue_insert(&dest_hex, "Outbox", id, &from, rcpt)
-                {
-                    tracing::error!("SMTP: failed to enqueue for {}: {}", rcpt, e);
-                }
+            let Some(dest_key) = parse_address(rcpt) else {
+                tracing::error!("SMTP: rejecting mail — unparseable recipient {rcpt}");
+                let _ = writer
+                    .write_all(b"550 Invalid recipient address\r\n")
+                    .await;
+                // mail_delete только выставляет deleted=1 (семантика IMAP),
+                // строку physически убирает expunge. Без него в Outbox остался
+                // бы осиротевший «удалённый» экземпляр отвергнутого письма.
+                let _ = self.storage.mail_delete("Outbox", id);
+                let _ = self.storage.mail_expunge("Outbox");
+                self.from = None;
+                self.rcpts.clear();
+                self.state = State::ExpectMail;
+                return;
+            };
+            let dest_hex = hex::encode(dest_key);
+            if let Err(e) = self
+                .storage
+                .queue_insert(&dest_hex, "Outbox", id, &from, rcpt)
+            {
+                tracing::error!("SMTP: failed to enqueue for {}: {}", rcpt, e);
+                let _ = writer.write_all(b"451 Queue error\r\n").await;
+                self.from = None;
+                self.rcpts.clear();
+                self.state = State::ExpectMail;
+                return;
             }
+            queued += 1;
         }
 
         let _ = writer.write_all(b"250 OK\r\n").await;
-        tracing::info!(
-            "SMTP: queued mail from {} to {} recipients",
-            from,
-            self.rcpts.len()
-        );
+        // Считаем реально поставленное в очередь, а не число команд RCPT TO.
+        tracing::info!("SMTP: queued mail from {from} to {queued} recipients");
 
         self.from = None;
         self.rcpts.clear();
@@ -561,5 +585,77 @@ mod tests {
         // Verify queue entry exists
         let dests = storage.queue_list_destinations().unwrap();
         assert!(!dests.is_empty(), "queue should have a destination");
+    }
+
+    /// A recipient the address parser cannot read must fail the DATA loudly.
+    ///
+    /// Regression guard for a silent mail sink: the old code skipped such a
+    /// recipient, left the mail sitting in Outbox with no queue row, answered
+    /// 250 OK, and logged a success count taken from `rcpts.len()`. The sender
+    /// then found no destinations and returned without logging, so a message
+    /// vanished with nothing in the log to show for it. Go fails DATA here
+    /// (`smtpsender/sender.go`, QueueFor returns an error) and so must we.
+    #[tokio::test]
+    async fn unparseable_recipient_fails_data_and_leaves_nothing_queued() {
+        let storage = Arc::new(temp_db("bad_rcpt"));
+        let local_key = [0x42u8; 32];
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv_storage = storage.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_conn(stream, srv_storage, local_key, None).await;
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 1024];
+
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"220 "));
+
+        stream.write_all(b"HELO test\r\n").await.unwrap();
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"250 "));
+
+        let from = crate::address::create_address(&local_key);
+        stream
+            .write_all(format!("MAIL FROM:<{}>\r\n", from).as_bytes())
+            .await
+            .unwrap();
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"250 "));
+
+        // Syntactically fine as an SMTP path, but not a yggmail address.
+        stream
+            .write_all(b"RCPT TO:<somebody@example.com>\r\n")
+            .await
+            .unwrap();
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"250 "), "RCPT is accepted at command level");
+
+        stream.write_all(b"DATA\r\n").await.unwrap();
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"354 "));
+
+        stream
+            .write_all(b"Subject: Test\r\n\r\nbody\r\n.\r\n")
+            .await
+            .unwrap();
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(
+            buf[..n].starts_with(b"550 "),
+            "DATA must be rejected, got {:?}",
+            String::from_utf8_lossy(&buf[..n])
+        );
+
+        // Nothing may be left behind: no queue row, and no orphan in Outbox
+        // that a later run could mistake for deliverable mail.
+        let dests = storage.queue_list_destinations().unwrap();
+        assert!(dests.is_empty(), "nothing should be queued, got {dests:?}");
+        let ids = storage.mail_list("Outbox").unwrap();
+        assert!(ids.is_empty(), "Outbox should hold no orphan, got {ids:?}");
     }
 }
