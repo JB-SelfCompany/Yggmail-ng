@@ -1,8 +1,8 @@
-//! Outbound queue sender: polls DB → readiness-gate → YMP → mark sent.
+//! Outbound queue sender: polls DB → readiness-gate → QUIC → mark sent.
 //! ponytail: simple poll loop, 30s base / 10s fast-retry interval. No backpressure or prioritisation yet.
 
+use crate::quic::QuicMailTransport;
 use crate::storage::SqliteStorage;
-use crate::ymp::YmpSession;
 use std::sync::Arc;
 use tokio::time::{Duration, Instant, sleep_until};
 use tracing;
@@ -14,10 +14,10 @@ use yggdrasil::links::PeerEvent;
 const READINESS_WAIT: Duration = Duration::from_secs(20);
 
 /// Start the outbound sender background task.
-/// Polls the queue every `interval`, gates on peer readiness, then sends via YMP.
+/// Polls the queue every `interval`, gates on peer readiness, then sends via QUIC.
 pub fn spawn(
     storage: Arc<SqliteStorage>,
-    ymp: Arc<YmpSession>,
+    quic: Arc<QuicMailTransport>,
     core: Arc<Core>,
     base_interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
@@ -28,7 +28,7 @@ pub fn spawn(
 
         let notify = storage.queue_notify();
         loop {
-            match process_queue(&storage, &ymp, &core).await {
+            match process_queue(&storage, &quic, &core).await {
                 Ok(()) => {
                     // ponytail: success → back to base interval
                     interval = Duration::from_secs(30);
@@ -51,7 +51,7 @@ pub fn spawn(
 
 async fn process_queue(
     storage: &SqliteStorage,
-    ymp: &YmpSession,
+    quic: &QuicMailTransport,
     core: &Arc<Core>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let destinations = storage.queue_list_destinations()?;
@@ -104,8 +104,8 @@ async fn process_queue(
                 return Err("deferred: no up peer".into());
             }
 
-            match ymp.send(dest_key, mail.mail.clone()).await {
-                Ok(_msg_id) => {
+            match quic.send(dest_key, mail.mail.clone()).await {
+                Ok(()) => {
                     // Delete-first: drop the queue entry while the mail is still in
                     // Outbox so it matches (dest, "Outbox", id). Delivery is already
                     // confirmed, so de-queuing is the durable "done" marker. Doing
@@ -125,8 +125,8 @@ async fn process_queue(
                     tracing::info!("sender: mail #{id} delivered, de-queued", id = qm.id);
                 }
                 Err(e) => {
-                    tracing::warn!("sender: YMP send failed for #{id}: {e}", id = qm.id);
-                    // Will retry on next poll cycle
+                    tracing::warn!("sender: QUIC send failed for #{id}: {e}", id = qm.id);
+                    // Повтор на следующем цикле опроса
                 }
             }
         }

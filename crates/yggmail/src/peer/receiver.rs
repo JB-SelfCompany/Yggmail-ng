@@ -1,44 +1,57 @@
-//! Inbound mail receiver: YMP → DB (INBOX).
-//! ponytail: minimal — no IMAP IDLE notify until Phase 5.
+//! Приём входящей почты: транспорт → БД (INBOX).
+//!
+//! На время сосуществования транспортов слушаем оба: QUIC (узлы 1.8 и все
+//! обновлённые) и YMP (уже выкаченные 1.9.0, которые умеют только его).
+//! Когда YMP уйдёт, параметр `ymp` и вся его ветка удаляются.
 
+use crate::quic::QuicMailTransport;
 use crate::storage::SqliteStorage;
 use crate::ymp::YmpSession;
 use std::sync::Arc;
 use tracing;
 
-/// Start the inbound receiver background task.
-/// Reads assembled messages from YMP and stores them in INBOX.
-pub fn spawn(storage: Arc<SqliteStorage>, ymp: Arc<YmpSession>) -> tokio::task::JoinHandle<()> {
+/// Запустить фоновый приём. `ymp` — `None`, когда YMP уже удалён.
+pub fn spawn(
+    storage: Arc<SqliteStorage>,
+    quic: Arc<QuicMailTransport>,
+    ymp: Option<Arc<YmpSession>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            match ymp.recv().await {
-                Ok((from_key, data)) => {
-                    let from_addr = crate::address::create_address(&from_key);
-                    match storage.mail_insert_inbox_dedup(&from_key, &data) {
-                        Ok(Some(_id)) => {
-                            tracing::info!(
-                                "receiver: new mail from {} ({} bytes)",
-                                &from_addr[..16],
-                                data.len()
-                            );
-                        }
-                        Ok(None) => {
-                            tracing::debug!(
-                                "receiver: duplicate mail from {} dropped",
-                                &from_addr[..16]
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!("receiver: failed to store mail: {e}");
-                        }
-                    }
-                }
+            let received = match &ymp {
+                Some(ymp) => tokio::select! {
+                    r = quic.recv() => r.map_err(|e| e.to_string()),
+                    r = ymp.recv() => r.map_err(|e| e.to_string()),
+                },
+                None => quic.recv().await.map_err(|e| e.to_string()),
+            };
+
+            match received {
+                Ok((from_key, data)) => store(&storage, from_key, &data),
                 Err(e) => {
-                    tracing::error!("receiver: YMP recv error: {e}");
-                    // ponytail: exponential backoff in Phase 3+ if needed
+                    tracing::error!("receiver: recv error: {e}");
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             }
         }
     })
+}
+
+fn store(storage: &SqliteStorage, from_key: [u8; 32], data: &[u8]) {
+    let from_addr = crate::address::create_address(&from_key);
+    match storage.mail_insert_inbox_dedup(&from_key, data) {
+        Ok(Some(id)) => {
+            tracing::info!(
+                "receiver: stored in INBOX id={id} from {} ({} bytes)",
+                &from_addr[..16],
+                data.len()
+            );
+        }
+        Ok(None) => {
+            tracing::debug!("receiver: duplicate mail from {} dropped", &from_addr[..16]);
+        }
+        Err(e) => {
+            tracing::error!("receiver: failed to store mail: {e}");
+        }
+    }
 }

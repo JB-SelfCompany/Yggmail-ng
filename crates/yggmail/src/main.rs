@@ -113,16 +113,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     core.start().await;
     tracing::info!("Core started");
 
-    let conn = CoreConn::new(core.clone(), signing_key);
-    let ymp = Arc::new(YmpSession::new(
+    // Демукс: один владелец Core::read_from разводит датаграммы между
+    // транспортами по QUIC Fixed Bit. Уйдёт вместе с YMP.
+    let conn = CoreConn::new(core.clone(), signing_key.clone());
+    let (ymp_conn, quic_conn) = yggmail::core_conn::demux(
         conn as Arc<dyn ironwood::types::PacketConn>,
-    ));
+        signing_key.clone(),
+    );
+
+    let ymp = Arc::new(YmpSession::new(ymp_conn as Arc<dyn ironwood::types::PacketConn>));
+    let quic = yggmail::quic::QuicMailTransport::new(
+        quic_conn as Arc<dyn ironwood::types::PacketConn>,
+        &signing_key,
+    )
+    .map_err(|e| format!("quic overlay: {e}"))?;
 
     // ── Peer exchange ─────────────────────────────────────────────────
-    let _receiver = peer::receiver::spawn(storage.clone(), ymp.clone());
+    let _receiver = peer::receiver::spawn(storage.clone(), quic.clone(), Some(ymp.clone()));
     let _sender = peer::sender::spawn(
         storage.clone(),
-        ymp.clone(),
+        quic.clone(),
         core.clone(),
         tokio::time::Duration::from_secs(30),
     );
