@@ -204,10 +204,11 @@ impl YggmailMobile {
             let (stop_tx, _) = broadcast::channel(1);
             let (active_tx, _) = broadcast::channel(1);
             // IMAP notification channel — wakes IDLE clients (Delta Chat)
-            // when YMP delivers new mail to INBOX.
+            // when either transport delivers new mail to INBOX.
             let (imap_notify_tx, _) = broadcast::channel::<()>(16);
 
-            // Spawn receiver (YMP -> INBOX)
+            // Spawn receiver (QUIC and YMP -> INBOX). NOT YMP-only: this block
+            // must survive the removal of the YMP session.
             let rx_storage = storage.clone();
             let rx_ymp = ymp.clone();
             let rx_quic = quic.clone();
@@ -255,7 +256,7 @@ impl YggmailMobile {
                 }
             });
 
-            // Spawn outbound sender (polls queue -> readiness-gate -> YMP delivery).
+            // Spawn outbound sender (polls queue -> readiness-gate -> QUIC delivery).
             // The sender waits for ≥1 "up" peer before each send (wait_for_up_peer),
             // so send_mail is enqueue-only and never blocks the Android serviceHandler.
             let tx_storage = storage.clone();
