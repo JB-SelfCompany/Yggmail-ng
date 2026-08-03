@@ -47,6 +47,19 @@ pub fn insert(
     key: Option<&[u8; 32]>,
 ) -> Result<u32, rusqlite::Error> {
     let conn = super::lock_db(db);
+    insert_with(&conn, mailbox, raw, key)
+}
+
+/// Body of `insert`, taking an already-open connection (or transaction, via
+/// `Transaction`'s `Deref<Target = Connection>`) instead of locking one itself.
+/// Lets callers fold the insert into a larger transaction — e.g. INBOX dedup
+/// needs the fingerprint and the mail to commit together.
+pub fn insert_with(
+    conn: &Connection,
+    mailbox: &str,
+    raw: &[u8],
+    key: Option<&[u8; 32]>,
+) -> Result<u32, rusqlite::Error> {
     // Encrypt when a data key is available; otherwise store raw (legacy/plaintext mode).
     let encrypted_buf;
     let blob: &[u8] = if let Some(dk) = key {

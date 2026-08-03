@@ -270,26 +270,29 @@ impl SqliteStorage {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
+        // Only dedup within a short window: rapid network/app re-delivery of the
+        // exact same bytes happens within seconds. Pruning older fingerprints
+        // bounds the table and guarantees a legit recurring mail is never
+        // permanently blocked.
+        const DEDUP_WINDOW_SECS: i64 = 600;
+        let mut conn = lock_db(&self.db);
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM inbox_seen WHERE datetime < ?1",
+            rusqlite::params![now - DEDUP_WINDOW_SECS],
+        )?;
+        if tx.execute(
+            "INSERT OR IGNORE INTO inbox_seen (fp, datetime) VALUES (?1, ?2)",
+            rusqlite::params![fp, now],
+        )? == 0
         {
-            let conn = lock_db(&self.db);
-            // Only dedup within a short window: rapid network/app re-delivery of the
-            // exact same bytes happens within seconds. Pruning older fingerprints
-            // bounds the table and guarantees a legit recurring mail is never
-            // permanently blocked.
-            const DEDUP_WINDOW_SECS: i64 = 600;
-            conn.execute(
-                "DELETE FROM inbox_seen WHERE datetime < ?1",
-                rusqlite::params![now - DEDUP_WINDOW_SECS],
-            )?;
-            let inserted = conn.execute(
-                "INSERT OR IGNORE INTO inbox_seen (fp, datetime) VALUES (?1, ?2)",
-                rusqlite::params![fp, now],
-            )?;
-            if inserted == 0 {
-                return Ok(None); // duplicate seen within the window
-            }
-        } // guard dropped here; std Mutex is not reentrant — mail_insert takes it next
-        let id = self.mail_insert("INBOX", raw)?;
+            return Ok(None); // duplicate seen within the window
+        }
+        // The fingerprint and the mail commit together: if the insert below
+        // fails, the whole transaction rolls back and no fingerprint remains,
+        // so a retry stores the mail instead of treating it as a duplicate.
+        let id = mails::insert_with(&tx, "INBOX", raw, self.at_rest_key.as_ref())?;
+        tx.commit()?;
         Ok(Some(id))
     }
 
@@ -542,6 +545,37 @@ mod tests {
         assert_eq!(
             mail.mail, raw,
             "mail must decrypt correctly after password change"
+        );
+    }
+
+    /// Отказ укладки не должен оставлять отпечаток: иначе повтор посчитает
+    /// письмо дубликатом и потеряет его молча.
+    #[test]
+    fn failed_insert_leaves_no_dedup_fingerprint() {
+        let storage = temp_db("dedup_atomic");
+        let from = [0x11u8; 32];
+        let raw = b"Subject: x\r\n\r\nbody\r\n";
+
+        // Ломаем укладку: убираем таблицу mails, дедуп-таблицу оставляем.
+        {
+            let conn = lock_db(&storage.db);
+            conn.execute("DROP TABLE mails", []).unwrap();
+        }
+        assert!(
+            storage.mail_insert_inbox_dedup(&from, raw).is_err(),
+            "insert must fail once the table is gone"
+        );
+
+        // Возвращаем работоспособность и повторяем: письмо обязано уложиться,
+        // а не быть отброшенным как дубликат.
+        {
+            let conn = lock_db(&storage.db);
+            conn.execute_batch(mails::SCHEMA).unwrap();
+        }
+        let stored = storage.mail_insert_inbox_dedup(&from, raw).unwrap();
+        assert!(
+            stored.is_some(),
+            "retry after a failed insert must store the mail"
         );
     }
 
