@@ -72,6 +72,12 @@ async fn process_queue(
             }
         };
 
+        // Самому себе — локально, до readiness-gate.
+        if dest_key == *core.public_key() {
+            deliver_to_self(storage, dest_hex, &dest_key)?;
+            continue;
+        }
+
         let pending = storage.queue_get_for_destination(dest_hex)?;
         for qm in &pending {
             // Fetch the mail body from Outbox
@@ -169,4 +175,78 @@ async fn wait_for_up_peer(core: &Arc<Core>, deadline: Instant) -> bool {
 /// Whether any currently-known peer link is in the "up" state.
 async fn has_up_peer(core: &Core) -> bool {
     core.get_peers().await.iter().any(|p| p.up)
+}
+
+/// Доставить письма, адресованные собственному ключу, минуя сеть.
+///
+/// Повторяет ветку `isSelfSend` из Go (`smtpsender/sender.go:326`). Стоит до
+/// readiness-gate: доставка самому себе не зависит от наличия пиров, а попытка
+/// дозвониться по QUIC до самого себя — это в лучшем случае бессмысленный
+/// круг, в худшем зависание до idle-таймаута.
+fn deliver_to_self(
+    storage: &SqliteStorage,
+    dest_hex: &str,
+    local_key: &[u8; 32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for qm in &storage.queue_get_for_destination(dest_hex)? {
+        let Some(mail) = storage.mail_get("Outbox", qm.id)? else {
+            let _ = storage.queue_delete(dest_hex, "Outbox", qm.id);
+            continue;
+        };
+        // Тот же путь, что у приёмника: дедуп защищает от повторной укладки,
+        // если снятие с очереди не доехало и опрос вернулся к тому же письму.
+        storage.mail_insert_inbox_dedup(local_key, &mail.mail)?;
+        storage.queue_delete(dest_hex, "Outbox", qm.id)?;
+        if storage.queue_count_for_mail("Outbox", qm.id)? == 0 {
+            let _ = storage.mail_move("Outbox", "Sent", qm.id);
+        }
+        tracing::info!("sender: mail #{id} delivered locally (self-send)", id = qm.id);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db(name: &str) -> SqliteStorage {
+        let path = std::env::temp_dir().join(format!(
+            "yggmail_sender_test_{}_{}.db",
+            std::process::id(),
+            name
+        ));
+        let _ = std::fs::remove_file(&path);
+        SqliteStorage::open(&path.to_string_lossy(), None).unwrap()
+    }
+
+    /// Письмо самому себе кладётся в INBOX и снимается с очереди, не касаясь сети.
+    #[test]
+    fn self_send_lands_in_inbox_and_leaves_the_queue() {
+        let storage = temp_db("self_send");
+        let me = [0x42u8; 32];
+        let me_hex = hex::encode(me);
+        let addr = crate::address::create_address(&me);
+
+        let id = storage
+            .mail_insert("Outbox", b"Subject: note\r\n\r\nto myself\r\n")
+            .unwrap();
+        storage
+            .queue_insert(&me_hex, "Outbox", id, &addr, &addr)
+            .unwrap();
+
+        deliver_to_self(&storage, &me_hex, &me).expect("local delivery ok");
+
+        assert!(
+            !storage.mail_list("INBOX").unwrap().is_empty(),
+            "self-sent mail must land in INBOX"
+        );
+        assert!(
+            storage.queue_list_destinations().unwrap().is_empty(),
+            "queue must be drained"
+        );
+        assert!(
+            !storage.mail_list("Sent").unwrap().is_empty(),
+            "the last recipient moves the mail to Sent"
+        );
+    }
 }
