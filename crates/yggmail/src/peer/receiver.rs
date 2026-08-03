@@ -18,12 +18,14 @@ pub fn spawn(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
+            // Транспорт называем в тексте ошибки: пока их два, по одной строке
+            // лога должно быть видно, какой именно отказал.
             let received = match &ymp {
                 Some(ymp) => tokio::select! {
-                    r = quic.recv() => r.map_err(|e| e.to_string()),
-                    r = ymp.recv() => r.map_err(|e| e.to_string()),
+                    r = quic.recv() => r.map_err(|e| format!("QUIC: {e}")),
+                    r = ymp.recv() => r.map_err(|e| format!("YMP: {e}")),
                 },
-                None => quic.recv().await.map_err(|e| e.to_string()),
+                None => quic.recv().await.map_err(|e| format!("QUIC: {e}")),
             };
 
             match received {

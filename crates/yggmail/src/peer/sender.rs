@@ -23,7 +23,7 @@ pub fn spawn(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = base_interval;
-        // Skip first tick so storage+ymp are fully initialised
+        // Skip first tick so storage+quic are fully initialised
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         let notify = storage.queue_notify();
@@ -126,7 +126,7 @@ async fn process_queue(
                 }
                 Err(e) => {
                     tracing::warn!("sender: QUIC send failed for #{id}: {e}", id = qm.id);
-                    // Повтор на следующем цикле опроса
+                    // Will retry on next poll cycle
                 }
             }
         }
