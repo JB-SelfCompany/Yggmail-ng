@@ -286,6 +286,12 @@ impl SqliteStorage {
             rusqlite::params![fp, now],
         )? == 0
         {
+            // ponytail: returning here rolls the prune back with the
+            // transaction, so stale rows are only swept on a call that goes on
+            // to store a new mail. Bounded, not a leak: a duplicate hit never
+            // adds a row (INSERT OR IGNORE affects 0), so the table stays the
+            // size of the distinct mails actually stored. Add a standalone
+            // prune only if that ever stops holding.
             return Ok(None); // duplicate seen within the window
         }
         // The fingerprint and the mail commit together: if the insert below
