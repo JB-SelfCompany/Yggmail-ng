@@ -18,6 +18,7 @@ use yggdrasil::core::Core;
 use yggmail::address::create_address;
 use yggmail::core_conn::CoreConn;
 use yggmail::identity::{load_or_migrate_identity, parse_signing_key};
+use yggmail::quic::QuicMailTransport;
 use yggmail::storage::SqliteStorage;
 use yggmail::ymp::YmpSession;
 
@@ -107,6 +108,7 @@ struct NodeState {
     _conn: Arc<CoreConn>,
     storage: Arc<SqliteStorage>,
     ymp: Arc<YmpSession>,
+    quic: Arc<QuicMailTransport>,
     stop_tx: broadcast::Sender<()>,
     active_tx: broadcast::Sender<bool>,
     receiver_handle: Option<tokio::task::JoinHandle<()>>,
@@ -183,10 +185,21 @@ impl YggmailMobile {
             core.init_links().await;
             core.start().await;
 
-            let conn = CoreConn::new(core.clone(), signing_key);
-            let ymp = Arc::new(YmpSession::new(
+            let conn = CoreConn::new(core.clone(), signing_key.clone());
+            // Демукс: один владелец Core::read_from разводит датаграммы между
+            // транспортами по QUIC Fixed Bit. Уйдёт вместе с YMP.
+            let (ymp_conn, quic_conn) = yggmail::core_conn::demux(
                 conn.clone() as Arc<dyn ironwood::types::PacketConn>,
+                signing_key.clone(),
+            );
+            let ymp = Arc::new(YmpSession::new(
+                ymp_conn as Arc<dyn ironwood::types::PacketConn>,
             ));
+            let quic = QuicMailTransport::new(
+                quic_conn as Arc<dyn ironwood::types::PacketConn>,
+                &signing_key,
+            )
+            .map_err(|e| YggmailError::Runtime(format!("quic overlay: {e}")))?;
 
             let (stop_tx, _) = broadcast::channel(1);
             let (active_tx, _) = broadcast::channel(1);
@@ -197,6 +210,7 @@ impl YggmailMobile {
             // Spawn receiver (YMP -> INBOX)
             let rx_storage = storage.clone();
             let rx_ymp = ymp.clone();
+            let rx_quic = quic.clone();
             let rx_stop = stop_tx.subscribe();
             let rx_imap_notify = imap_notify_tx.clone();
             let receiver_handle = tokio::spawn(async move {
@@ -204,13 +218,18 @@ impl YggmailMobile {
                 loop {
                     tokio::select! {
                         _ = stop_rx.recv() => break,
-                        msg = rx_ymp.recv() => {
+                        msg = async {
+                            tokio::select! {
+                                r = rx_quic.recv() => r.map_err(|e| e.to_string()),
+                                r = rx_ymp.recv() => r.map_err(|e| e.to_string()),
+                            }
+                        } => {
                             match msg {
                                 Ok((from_key, data)) => {
-                                    tracing::info!("mobile: received mail via YMP, {} bytes", data.len());
+                                    tracing::info!("mobile: received mail, {} bytes", data.len());
                                     match rx_storage.mail_insert_inbox_dedup(&from_key, &data) {
                                         Ok(Some(id)) => {
-                                            tracing::info!("mobile: stored mail in INBOX, id={}", id);
+                                            tracing::info!("mobile: stored in INBOX id={}", id);
                                             // Notify IMAP IDLE clients (Delta Chat)
                                             let _ = rx_imap_notify.send(());
                                         }
@@ -226,7 +245,10 @@ impl YggmailMobile {
                                         }
                                     }
                                 }
-                                Err(_) => tokio::time::sleep(Duration::from_secs(1)).await,
+                                Err(e) => {
+                                    tracing::debug!("mobile: recv error: {e}");
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                }
                             }
                         }
                     }
@@ -237,15 +259,15 @@ impl YggmailMobile {
             // The sender waits for ≥1 "up" peer before each send (wait_for_up_peer),
             // so send_mail is enqueue-only and never blocks the Android serviceHandler.
             let tx_storage = storage.clone();
-            let tx_ymp = ymp.clone();
-            yggmail::peer::sender::spawn(tx_storage, tx_ymp, core.clone(), Duration::from_secs(30));
+            let tx_quic = quic.clone();
+            yggmail::peer::sender::spawn(tx_storage, tx_quic, core.clone(), Duration::from_secs(30));
 
             // Path-warmer: keep the Yggdrasil path to recently-active correspondents
             // warm. ironwood expires a cached path after ~60s (path_timeout); the Go
             // library kept it warm via QUIC keepalive/heartbeat, which the Rust rewrite
             // dropped — the root cause of slow/failed reconnection vs Go. Re-warm every
             // 25s (< 60s) via send_lookup for peers seen in the last 10 minutes.
-            let warm_ymp = ymp.clone();
+            let warm_quic = quic.clone();
             let warm_core = core.clone();
             let mut warm_stop = stop_tx.subscribe();
             tokio::spawn(async move {
@@ -255,7 +277,7 @@ impl YggmailMobile {
                     tokio::select! {
                         _ = warm_stop.recv() => break,
                         _ = tick.tick() => {
-                            for peer in warm_ymp.recent_peers(Duration::from_secs(600)).await {
+                            for peer in warm_quic.recent_peers(Duration::from_secs(600)).await {
                                 warm_core.send_lookup(ironwood::types::Addr(peer)).await;
                             }
                         }
@@ -269,6 +291,7 @@ impl YggmailMobile {
                 _conn: conn,
                 storage,
                 ymp,
+                quic,
                 stop_tx,
                 active_tx,
                 imap_notify_tx: Some(imap_notify_tx),
