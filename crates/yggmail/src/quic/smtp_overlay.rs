@@ -199,9 +199,16 @@ async fn read_data<R: AsyncRead + Unpin>(
 
 /// Отправить одно письмо как SMTP-клиент: прочитать greeting и ответы, пройти
 /// диалог, заэкранировать точки. Любой не-2xx по пути — ошибка протокола.
+/// `local_hostname` — hex нашего собственного публичного ключа, и это не
+/// косметика. Go-сервер сверяет аргумент EHLO с ключом пира, от которого пришли
+/// датаграммы (`internal/smtpserver/backend.go:95-103`): при расхождении диалог
+/// отбивается с `502 5.7.0 you are not who you claim to be`. Go-клиент шлёт туда
+/// `hex(own pubkey)` (`smtpsender/sender.go`, `client.Hello`), и мы обязаны так же —
+/// иначе ни одно письмо на узел 1.8 не пройдёт.
 pub(crate) async fn overlay_send_stream<R, W>(
     reader: R,
     mut writer: W,
+    local_hostname: &str,
     from: &str,
     rcpts: &[String],
     body: &[u8],
@@ -213,7 +220,9 @@ where
     let mut reader = BufReader::new(reader);
     expect_code(&mut reader, b'2').await?; // 220 greeting
 
-    writer.write_all(b"EHLO yggmail\r\n").await?;
+    writer
+        .write_all(format!("EHLO {local_hostname}\r\n").as_bytes())
+        .await?;
     writer.flush().await?;
     expect_code(&mut reader, b'2').await?;
 
@@ -343,7 +352,7 @@ mod tests {
         let server =
             tokio::spawn(async move { overlay_serve_stream(sr, sw, recipient_key, sender_key).await });
         let client = tokio::spawn(async move {
-            overlay_send_stream(cr, cw, &addr(&sender_key), &[addr(&recipient_key)], body.as_bytes())
+            overlay_send_stream(cr, cw, &hex::encode(sender_key), &addr(&sender_key), &[addr(&recipient_key)], body.as_bytes())
                 .await
         });
 
@@ -428,7 +437,7 @@ mod tests {
         let server =
             tokio::spawn(async move { overlay_serve_stream(sr, sw, recipient_key, sender_key).await });
         let client = tokio::spawn(async move {
-            overlay_send_stream(cr, cw, &addr(&sender_key), &[addr(&recipient_key)], &body).await
+            overlay_send_stream(cr, cw, &hex::encode(sender_key), &addr(&sender_key), &[addr(&recipient_key)], &body).await
         });
 
         client.await.unwrap().expect("client dialog ok");
@@ -457,6 +466,7 @@ mod tests {
             overlay_send_stream(
                 cr,
                 cw,
+                &hex::encode(spoofed),
                 &addr(&spoofed),
                 &[addr(&[0x22u8; 32])],
                 b"Subject: x\r\n\r\nbad\r\n",
@@ -497,6 +507,52 @@ mod tests {
 
         let res = server.await.unwrap();
         assert!(matches!(res, Err(OverlayError::TooLarge)), "got {res:?}");
+    }
+
+    /// Клиент обязан представиться в EHLO hex своего публичного ключа.
+    ///
+    /// Go-сервер сверяет аргумент EHLO с ключом пира, от которого пришли
+    /// датаграммы (`internal/smtpserver/backend.go:95-103`), и на расхождении
+    /// отвечает `502 5.7.0 you are not who you claim to be`. Наш собственный
+    /// сервер аргумент EHLO не проверяет, поэтому диалог «клиент↔наш сервер»
+    /// такую регрессию не заметит — она видна только против Go. Этот тест
+    /// читает то, что клиент реально пишет в поток.
+    #[tokio::test]
+    async fn client_announces_its_own_key_in_ehlo() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+
+        let sender_key = [0xC3u8; 32];
+        let recipient_key = [0xD4u8; 32];
+
+        let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+        let (cr, cw) = split(client_side);
+        let (sr, mut sw) = split(server_side);
+
+        tokio::spawn(async move {
+            overlay_send_stream(
+                cr,
+                cw,
+                &hex::encode(sender_key),
+                &addr(&sender_key),
+                &[addr(&recipient_key)],
+                b"Subject: x\r\n\r\nbody\r\n",
+            )
+            .await
+        });
+
+        sw.write_all(b"220 ready\r\n").await.unwrap();
+        sw.flush().await.unwrap();
+
+        let mut reader = TokioBufReader::new(sr);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+
+        assert_eq!(
+            line.trim(),
+            format!("EHLO {}", hex::encode(sender_key)),
+            "EHLO must carry hex(own pubkey); \"EHLO yggmail\" makes a 1.8 node \
+             answer 502 and rejects every mail we send it"
+        );
     }
 
     #[test]

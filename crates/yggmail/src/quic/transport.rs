@@ -177,9 +177,12 @@ impl QuicMailTransport {
             .map_err(|e| QuicMailError::Transport(format!("kick flush: {e}")))?;
         tracing::info!("quic: stream open, kick sent to {}", hex::encode(&dest[..8]));
 
+        // EHLO должен нести hex нашего ключа: Go-сервер сверяет его с адресом
+        // источника датаграмм и иначе отвечает 502 (см. overlay_send_stream).
+        let local_hostname = hex::encode(self.local_key);
         let from = create_address(&self.local_key);
         let rcpts = vec![create_address(&dest)];
-        overlay_send_stream(recv, send, &from, &rcpts, &message).await?;
+        overlay_send_stream(recv, send, &local_hostname, &from, &rcpts, &message).await?;
 
         self.note_active(dest).await;
         Ok(())
