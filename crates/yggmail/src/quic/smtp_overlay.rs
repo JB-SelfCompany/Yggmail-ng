@@ -13,6 +13,10 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 /// Стриминг и файловое хранилище из продукта убраны, поэтому лимит один.
 const MAX_DATA_BYTES: usize = 33 * 1024 * 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024;
+/// Потолок строк-продолжений `250-...` в ответе. 1.8 никогда не шлёт больше
+/// нескольких (SIZE/8BITMIME на EHLO) — 32 с большим запасом отличает
+/// реальный многострочный ответ от пира, который крутит цикл вечно.
+const MAX_CONTINUATION_LINES: u32 = 32;
 
 /// Ошибки оверлейного диалога.
 /// ponytail: ручной Display вместо thiserror — стиль крейта.
@@ -291,7 +295,7 @@ async fn expect_code<R: AsyncRead + Unpin>(
     class: u8,
 ) -> Result<(), OverlayError> {
     let mut line = Vec::new();
-    loop {
+    for _ in 0..MAX_CONTINUATION_LINES {
         let n = read_line(reader, &mut line).await?;
         if n == 0 {
             return Err(OverlayError::Protocol("peer closed mid-dialog".into()));
@@ -307,6 +311,7 @@ async fn expect_code<R: AsyncRead + Unpin>(
             ))),
         };
     }
+    Err(OverlayError::Protocol("too many continuation lines".into()))
 }
 
 /// Достать обратный/прямой путь из `MAIL FROM:` / `RCPT TO:` по RFC 5321.
@@ -330,7 +335,7 @@ fn extract_path(line: &[u8], prefix: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncWriteExt, split};
+    use tokio::io::{AsyncWriteExt, duplex, split};
 
     fn addr(key: &[u8; 32]) -> String {
         crate::address::create_address(key)
@@ -552,6 +557,33 @@ mod tests {
             format!("EHLO {}", hex::encode(sender_key)),
             "EHLO must carry hex(own pubkey); \"EHLO yggmail\" makes a 1.8 node \
              answer 502 and rejects every mail we send it"
+        );
+    }
+
+    /// Пир, который шлёт бесконечный поток строк-продолжений `250-...`, не
+    /// должен раскручивать цикл `expect_code` вечно — потолок числа строк
+    /// обязан оборвать его ошибкой вместо того, чтобы дочитать до настоящего
+    /// финального ответа.
+    #[tokio::test]
+    async fn expect_code_bails_out_after_too_many_continuation_lines() {
+        let (client_side, mut server_side) = duplex(64 * 1024);
+        let (cr, _cw) = split(client_side);
+
+        tokio::spawn(async move {
+            for _ in 0..(MAX_CONTINUATION_LINES as usize + 10) {
+                if server_side.write_all(b"250-continuing\r\n").await.is_err() {
+                    return;
+                }
+            }
+            let _ = server_side.write_all(b"250 done\r\n").await;
+            let _ = server_side.flush().await;
+        });
+
+        let mut reader = BufReader::new(cr);
+        let res = expect_code(&mut reader, b'2').await;
+        assert!(
+            matches!(res, Err(OverlayError::Protocol(_))),
+            "must bail out instead of consuming an unbounded run of continuation lines, got {res:?}"
         );
     }
 

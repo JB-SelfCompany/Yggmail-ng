@@ -22,6 +22,17 @@ use crate::address::create_address;
 /// backpressure. ponytail: письма редкие, 64 хватает с запасом.
 const RECV_QUEUE_DEPTH: usize = 64;
 
+/// Дозвон до пира ограничен этим временем — совпадает с
+/// `HandshakeIdleTimeout: 10s` у Go (`internal/transport/yggdrasil.go:57`).
+/// Дольше — пир недоступен, и очередь обязана перейти к следующему адресату,
+/// а не ждать 30-минутный `max_idle_timeout` из `overlay_transport_config`.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Весь SMTP-диалог по уже открытому соединению: `open_bi` + kick-байт +
+/// `overlay_send_stream`. YMP, который заменили, давал попытке 30с; здесь
+/// диалог многошаговый (EHLO/MAIL/RCPT/DATA), поэтому бюджет шире.
+const DIALOG_TIMEOUT: Duration = Duration::from_secs(120);
+
 #[derive(Debug)]
 pub enum QuicMailError {
     Transport(String),
@@ -174,6 +185,36 @@ impl QuicMailTransport {
     pub async fn send(&self, dest: [u8; 32], message: Vec<u8>) -> Result<(), QuicMailError> {
         let connection = self.connection_for(dest).await?;
 
+        match tokio::time::timeout(DIALOG_TIMEOUT, self.dialog(&connection, dest, &message)).await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                // Пир мог принять хендшейк и затем замолчать: idle-таймаут
+                // соединения — 1800с, и keep-alive не даёт ему сработать, пока
+                // транспорт вообще жив. Раз диалог не продвинулся за отведённое
+                // время, закрыть соединение и выбросить его из кэша — иначе
+                // следующий send() к тому же пиру унаследует тот же труп и
+                // снова простоит полный таймаут (`open_bi` на закэшированном
+                // соединении к молчащему пиру не вернёт ошибку сам по себе).
+                connection.close(0u32.into(), b"dialog timeout");
+                self.conns.lock().await.remove(&dest);
+                Err(QuicMailError::Transport(format!(
+                    "dialog: {}",
+                    std::io::Error::from(std::io::ErrorKind::TimedOut)
+                )))
+            }
+        }
+    }
+
+    /// Один SMTP-диалог по уже установленному соединению: `open_bi` + kick-
+    /// байт + `overlay_send_stream`. Вынесено из `send()`, чтобы весь диалог
+    /// целиком помещался под один `tokio::time::timeout`.
+    async fn dialog(
+        &self,
+        connection: &Connection,
+        dest: [u8; 32],
+        message: &[u8],
+    ) -> Result<(), QuicMailError> {
         let (mut send, recv) = match connection.open_bi().await {
             Ok(s) => s,
             Err(e) => {
@@ -199,7 +240,7 @@ impl QuicMailTransport {
         let local_hostname = hex::encode(self.local_key);
         let from = create_address(&self.local_key);
         let rcpts = vec![create_address(&dest)];
-        overlay_send_stream(recv, send, &local_hostname, &from, &rcpts, &message).await?;
+        overlay_send_stream(recv, send, &local_hostname, &from, &rcpts, message).await?;
 
         self.note_active(dest).await;
         Ok(())
@@ -254,11 +295,19 @@ impl QuicMailTransport {
                 }
             }
         }
-        let c = self
-            .overlay
-            .connect(dest)
-            .await
-            .map_err(QuicMailError::Transport)?;
+        let c = match tokio::time::timeout(DIAL_TIMEOUT, self.overlay.connect(dest)).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => return Err(QuicMailError::Transport(e)),
+            Err(_) => {
+                // `connect()` не вставляет ничего в кэш до успеха, так что
+                // тут нечего выбрасывать — следующий send() дозвонится заново
+                // сам по себе.
+                return Err(QuicMailError::Transport(format!(
+                    "dial: {}",
+                    std::io::Error::from(std::io::ErrorKind::TimedOut)
+                )));
+            }
+        };
         match peer_key(&c) {
             Some(pk) if pk == dest => {
                 tracing::info!("quic: handshake ok peer={}", hex::encode(&dest[..8]));
@@ -394,6 +443,84 @@ mod tests {
 
         let recent = alice.recent_peers(std::time::Duration::from_secs(60)).await;
         assert!(recent.contains(&pub_b), "peer must be tracked as recently active");
+    }
+
+    /// Дозвон до пира, который никогда не отвечает ни на один пакет
+    /// (недоступный узел), должен провалиться в бюджет `DIAL_TIMEOUT`, а не
+    /// висеть до внутреннего handshake-таймаута quinn (завязан на
+    /// `max_idle_timeout` = 1800с виртуального времени).
+    ///
+    /// Внешний `tokio::time::timeout(300s, ...)` — предохранитель теста, а
+    /// не часть проверяемого поведения: без него, если бы в коде вовсе не
+    /// было таймаута, тест завис бы на реальных 1800с виртуального времени,
+    /// которые paused-clock раскрутил бы мгновенно, но сама попытка это
+    /// сделать не должна зависеть от того, действительно ли quinn когда-то
+    /// сдаётся сам.
+    #[tokio::test(start_paused = true)]
+    async fn dial_to_unreachable_peer_fails_within_dial_budget() {
+        let key_a = SigningKey::from_bytes(&[41u8; 32]);
+        let key_b = SigningKey::from_bytes(&[42u8; 32]);
+        let pub_b = key_b.verifying_key().to_bytes();
+
+        // conn_b существует, чтобы дозвон был адресован реальному ключу, но
+        // никто её не читает — датаграммы от alice копятся непрочитанными.
+        // Это и есть «недоступный узел».
+        let (conn_a, _conn_b) = MemPacketConn::pair(key_a.clone(), key_b.clone());
+        let alice = QuicMailTransport::new(conn_a as Arc<dyn PacketConn>, &key_a).unwrap();
+
+        let start = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(300),
+            alice.send(pub_b, b"Subject: x\r\n\r\nbody\r\n".to_vec()),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        let result = outcome.expect("send must not hang past the 300s test safety bound");
+        assert!(result.is_err(), "send to an unreachable peer must fail");
+        assert!(
+            elapsed < Duration::from_secs(60),
+            "dial must fail within its budget, took {elapsed:?}"
+        );
+    }
+
+    /// Хендшейк проходит (иначе дозвон провалился бы раньше диалога), но
+    /// пир дальше молчит — не принимает bi-стрим и не пишет ни байта.
+    /// Диалог должен провалиться в бюджет `DIALOG_TIMEOUT`, а не висеть
+    /// неограниченно за счёт keep-alive, поддерживающего QUIC-соединение
+    /// живым на транспортном уровне.
+    #[tokio::test(start_paused = true)]
+    async fn dialog_with_silent_peer_fails_within_dialog_budget() {
+        let key_a = SigningKey::from_bytes(&[43u8; 32]);
+        let key_b = SigningKey::from_bytes(&[44u8; 32]);
+        let pub_b = key_b.verifying_key().to_bytes();
+
+        let (conn_a, conn_b) = MemPacketConn::pair(key_a.clone(), key_b.clone());
+        let alice = QuicMailTransport::new(conn_a as Arc<dyn PacketConn>, &key_a).unwrap();
+
+        // «Молчаливый сервер»: сырой QuicOverlay (не QuicMailTransport)
+        // принимает соединение один раз и дальше не делает ничего — ни
+        // accept_bi, ни единого байта в ответ.
+        let server = QuicOverlay::new(conn_b as Arc<dyn PacketConn>, &key_b).unwrap();
+        tokio::spawn(async move {
+            let _incoming = server.accept().await;
+            std::future::pending::<()>().await
+        });
+
+        let start = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(300),
+            alice.send(pub_b, b"Subject: x\r\n\r\nbody\r\n".to_vec()),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        let result = outcome.expect("send must not hang past the 300s test safety bound");
+        assert!(result.is_err(), "send against a silent peer must fail");
+        assert!(
+            elapsed < Duration::from_secs(150),
+            "dialog must fail within its budget, took {elapsed:?}"
+        );
     }
 
     /// Пир, чей сертификат заявляет чужой ключ, должен быть отвергнут.
