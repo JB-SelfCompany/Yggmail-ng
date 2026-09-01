@@ -106,6 +106,23 @@ impl QuicMailTransport {
                     connection.close(1u32.into(), b"no peer key");
                     continue;
                 };
+                // Сертификат ничего не доказывает: verify_tls13_signature в общем
+                // верификаторе возвращает assertion(), поэтому пир может заявить
+                // чужой ключ, не владея приватным. Публичный ключ = почтовый
+                // адрес, то есть общеизвестен. Сверяем с адресом источника
+                // датаграмм — его подделать нельзя, он подтверждён шифрованной
+                // сессией ironwood. Go делает то же самое (session_remote.go:41-43).
+                match overlay.source_key(&connection) {
+                    Some(src) if src == pk => {}
+                    _ => {
+                        tracing::warn!(
+                            "quic: rejecting {} — cert key does not match mesh source",
+                            hex::encode(&pk[..8])
+                        );
+                        connection.close(1u32.into(), b"cert key does not match mesh source");
+                        continue;
+                    }
+                }
                 tracing::info!("quic: handshake ok peer={}", hex::encode(&pk[..8]));
                 let Some(strong_self) = weak_self.upgrade() else {
                     tracing::debug!("quic: accept loop exiting: transport dropped");
@@ -377,5 +394,38 @@ mod tests {
 
         let recent = alice.recent_peers(std::time::Duration::from_secs(60)).await;
         assert!(recent.contains(&pub_b), "peer must be tracked as recently active");
+    }
+
+    /// Пир, чей сертификат заявляет чужой ключ, должен быть отвергнут.
+    ///
+    /// Сертификат ничего не доказывает: общий верификатор возвращает
+    /// assertion() вместо проверки CertificateVerify. Единственное надёжное
+    /// свидетельство — mesh-адрес источника, аутентифицированный шифрованной
+    /// сессией ironwood.
+    #[tokio::test]
+    async fn rejects_peer_whose_cert_key_is_not_its_mesh_address() {
+        let attacker_mesh = SigningKey::from_bytes(&[21u8; 32]);
+        let victim = SigningKey::from_bytes(&[22u8; 32]);
+        let server_key = SigningKey::from_bytes(&[23u8; 32]);
+        let server_pub = server_key.verifying_key().to_bytes();
+
+        let (conn_att, conn_srv) = MemPacketConn::pair(attacker_mesh.clone(), server_key.clone());
+
+        // Датаграммы уйдут с mesh-ключа атакующего, а сертификат заявит жертву.
+        let attacker = QuicMailTransport::new(conn_att as Arc<dyn PacketConn>, &victim).unwrap();
+        let server = QuicMailTransport::new(conn_srv as Arc<dyn PacketConn>, &server_key).unwrap();
+
+        let _ = attacker
+            .send(server_pub, b"Subject: spoof\r\n\r\nnot me\r\n".to_vec())
+            .await;
+
+        // Ничего не должно доехать до recv(): соединение обязано быть закрыто
+        // до SMTP-диалога.
+        let got = tokio::time::timeout(std::time::Duration::from_secs(3), server.recv()).await;
+        assert!(
+            got.is_err(),
+            "spoofed peer must not deliver mail, got {:?}",
+            got.map(|r| r.map(|(k, _)| hex::encode(k)))
+        );
     }
 }

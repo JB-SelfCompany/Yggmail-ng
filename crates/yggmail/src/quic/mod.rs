@@ -140,6 +140,16 @@ impl QuicOverlay {
         let incoming = self.endpoint.accept().await?;
         Some(incoming.await.map_err(|e| format!("quic accept: {e}")))
     }
+
+    /// Ключ пира, от которого физически пришли датаграммы этого соединения.
+    ///
+    /// Это единственное надёжное свидетельство личности: адрес источника
+    /// подтверждён шифрованной сессией ironwood, тогда как содержимое
+    /// сертификата пир выбирает произвольно — общий верификатор не проверяет
+    /// CertificateVerify.
+    pub(crate) fn source_key(&self, conn: &Connection) -> Option<[u8; 32]> {
+        self.table.key_for_addr(&conn.remote_address())
+    }
 }
 
 /// Достать ed25519-ключ пира из его TLS-сертификата.
