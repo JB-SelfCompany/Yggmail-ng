@@ -30,8 +30,34 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Весь SMTP-диалог по уже открытому соединению: `open_bi` + kick-байт +
 /// `overlay_send_stream`. YMP, который заменили, давал попытке 30с; здесь
-/// диалог многошаговый (EHLO/MAIL/RCPT/DATA), поэтому бюджет шире.
+/// диалог многошаговый (EHLO/MAIL/RCPT/DATA), поэтому бюджет шире. Это
+/// накладные расходы протокола, отдельные от переноса тела DATA — само тело
+/// добавляет свой бюджет поверх, см. `MIN_THROUGHPUT`.
 const DIALOG_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Таймаут должен ограничивать простой, а не саму работу. `DIALOG_TIMEOUT`
+/// один на всех делает `MAX_DATA_BYTES` (33 МиБ, `smtp_overlay.rs`) недостижимым
+/// на медленном многошаговом пути: 33 МиБ за 120с — это ~275 КБ/с сквозь mesh,
+/// и письмо ниже этой скорости обречено таймаутиться на каждой попытке отправки
+/// вечно. Поэтому бюджет диалога растёт с размером письма: `DIALOG_TIMEOUT` —
+/// это фиксированные накладные расходы протокола (EHLO/MAIL/RCPT/DATA-заголовок),
+/// а `message.len() / MIN_THROUGHPUT` — присланное сверху время на сам перенос
+/// тела при худшей допустимой скорости. 32 КиБ/с выбраны так, чтобы 33 МиБ
+/// укладывались в ~20 минут — меньше 30-минутного `max_idle_timeout` в
+/// `overlay_transport_config`, то есть транспорт не убьёт соединение, которое
+/// реально продвигается. Мёртвый пир по-прежнему стоит очереди только
+/// `DIAL_TIMEOUT` — этот бюджет расширяет только диалог с уже дозвонившимся,
+/// живым, но медленным пиром.
+const MIN_THROUGHPUT: u64 = 32 * 1024;
+
+/// Эффективный бюджет диалога для письма данного размера: фиксированные
+/// накладные расходы плюс время на передачу тела при `MIN_THROUGHPUT`.
+/// Сложение насыщающее — не ради переполнения (`MAX_DATA_BYTES` уже держит
+/// `message.len()` в разумных пределах), а чтобы не тащить сюда лишнюю
+/// проверку ради одной операции.
+fn dialog_budget(message_len: usize) -> Duration {
+    DIALOG_TIMEOUT.saturating_add(Duration::from_secs(message_len as u64 / MIN_THROUGHPUT))
+}
 
 #[derive(Debug)]
 pub enum QuicMailError {
@@ -184,9 +210,9 @@ impl QuicMailTransport {
     /// Отправить одно письмо пиру. Блокируется до подтверждения `250`.
     pub async fn send(&self, dest: [u8; 32], message: Vec<u8>) -> Result<(), QuicMailError> {
         let connection = self.connection_for(dest).await?;
+        let budget = dialog_budget(message.len());
 
-        match tokio::time::timeout(DIALOG_TIMEOUT, self.dialog(&connection, dest, &message)).await
-        {
+        match tokio::time::timeout(budget, self.dialog(&connection, dest, &message)).await {
             Ok(result) => result,
             Err(_) => {
                 // Пир мог принять хендшейк и затем замолчать: idle-таймаут
@@ -517,9 +543,85 @@ mod tests {
 
         let result = outcome.expect("send must not hang past the 300s test safety bound");
         assert!(result.is_err(), "send against a silent peer must fail");
+        // Нижняя граница обязательна: без неё этот тест ничего не отличает от
+        // повторного теста на DIAL_TIMEOUT (10с) — оба удовлетворили бы
+        // верхнюю границу в 150с. Раз хендшейк здесь проходит, провал обязан
+        // случиться именно на бюджете диалога, а не раньше.
+        assert!(
+            elapsed >= DIALOG_TIMEOUT,
+            "must fail on the dialog budget, not the dial budget, took {elapsed:?}"
+        );
         assert!(
             elapsed < Duration::from_secs(150),
             "dialog must fail within its budget, took {elapsed:?}"
+        );
+    }
+
+    /// Письмо крупнее, чем `DIALOG_TIMEOUT` в одиночку способен перенести при
+    /// `MIN_THROUGHPUT`, должно получить пропорционально больший бюджет — иначе
+    /// таймаут ограничивал бы саму работу, а не простой, и такое письмо
+    /// таймаутилось бы на каждой попытке отправки и никогда бы не доставилось.
+    #[tokio::test(start_paused = true)]
+    async fn dialog_with_silent_peer_gets_a_larger_budget_for_a_larger_message() {
+        let key_a = SigningKey::from_bytes(&[45u8; 32]);
+        let key_b = SigningKey::from_bytes(&[46u8; 32]);
+        let pub_b = key_b.verifying_key().to_bytes();
+
+        let (conn_a, conn_b) = MemPacketConn::pair(key_a.clone(), key_b.clone());
+        let alice = QuicMailTransport::new(conn_a as Arc<dyn PacketConn>, &key_a).unwrap();
+
+        let server = QuicOverlay::new(conn_b as Arc<dyn PacketConn>, &key_b).unwrap();
+        tokio::spawn(async move {
+            let _incoming = server.accept().await;
+            std::future::pending::<()>().await
+        });
+
+        let message = vec![0u8; 5 * 1024 * 1024];
+        let expected_budget = dialog_budget(message.len());
+        assert!(
+            expected_budget > DIALOG_TIMEOUT,
+            "test message must be large enough to actually stretch the budget"
+        );
+
+        let start = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            expected_budget + Duration::from_secs(60),
+            alice.send(pub_b, message),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        let result = outcome.expect("send must not hang past the test safety bound");
+        assert!(result.is_err(), "send against a silent peer must fail");
+        assert!(
+            elapsed >= expected_budget,
+            "must not fail before the size-scaled budget, took {elapsed:?}, budget {expected_budget:?}"
+        );
+        assert!(
+            elapsed < expected_budget + Duration::from_secs(30),
+            "must fail promptly once the size-scaled budget elapses, took {elapsed:?}"
+        );
+    }
+
+    /// Бюджет диалога растёт линейно с размером письма при `MIN_THROUGHPUT`,
+    /// но остаётся ниже 30-минутного `max_idle_timeout` даже для `MAX_DATA_BYTES`
+    /// — иначе транспорт убил бы соединение раньше, чем сработал бы сам бюджет.
+    #[test]
+    fn dialog_budget_grows_with_message_size_but_stays_under_idle_timeout() {
+        assert_eq!(
+            dialog_budget(0),
+            DIALOG_TIMEOUT,
+            "small mail keeps just the base protocol-overhead budget"
+        );
+        assert_eq!(
+            dialog_budget(MIN_THROUGHPUT as usize),
+            DIALOG_TIMEOUT + Duration::from_secs(1),
+            "one throughput-unit of bytes adds exactly one second"
+        );
+        let max_size_budget = dialog_budget(33 * 1024 * 1024);
+        assert!(
+            max_size_budget > DIALOG_TIMEOUT && max_size_budget < Duration::from_secs(1800),
+            "max-size mail must get a larger budget, but still under the QUIC idle timeout, got {max_size_budget:?}"
         );
     }
 
