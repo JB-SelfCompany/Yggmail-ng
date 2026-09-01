@@ -130,11 +130,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Peer exchange ─────────────────────────────────────────────────
     let _receiver = peer::receiver::spawn(storage.clone(), quic.clone(), Some(ymp.clone()));
+    // ponytail: the binary never stops the sender early (it runs until process
+    // exit), so this channel never fires — but `_stop_tx` must be a named
+    // binding, not `_`. A bare `_` drops the sender end on the spot, and
+    // broadcast::Receiver::recv() returns Err(Closed) the instant every sender
+    // is dropped, which `_ = stop.recv() => break` treats the same as a real
+    // stop signal — the outbound sender would exit right after the 2s startup
+    // delay, with mail delivery silently dead.
+    let (_stop_tx, stop_rx) = tokio::sync::broadcast::channel(1);
     let _sender = peer::sender::spawn(
         storage.clone(),
         quic.clone(),
         core.clone(),
         tokio::time::Duration::from_secs(30),
+        stop_rx,
     );
 
     // ── SMTP ──────────────────────────────────────────────────────────

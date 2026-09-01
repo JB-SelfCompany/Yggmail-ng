@@ -261,7 +261,8 @@ impl YggmailMobile {
             // so send_mail is enqueue-only and never blocks the Android serviceHandler.
             let tx_storage = storage.clone();
             let tx_quic = quic.clone();
-            yggmail::peer::sender::spawn(tx_storage, tx_quic, core.clone(), Duration::from_secs(30));
+            let tx_stop = stop_tx.subscribe();
+            yggmail::peer::sender::spawn(tx_storage, tx_quic, core.clone(), Duration::from_secs(30), tx_stop);
 
             // Path-warmer: keep the Yggdrasil path to recently-active correspondents
             // warm. ironwood expires a cached path after ~60s (path_timeout); the Go

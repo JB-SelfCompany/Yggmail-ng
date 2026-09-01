@@ -4,6 +4,7 @@
 use crate::quic::QuicMailTransport;
 use crate::storage::SqliteStorage;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tokio::time::{Duration, Instant, sleep_until};
 use tracing;
 use yggdrasil::core::Core;
@@ -15,11 +16,25 @@ const READINESS_WAIT: Duration = Duration::from_secs(20);
 
 /// Start the outbound sender background task.
 /// Polls the queue every `interval`, gates on peer readiness, then sends via QUIC.
+///
+/// `stop` is the shared shutdown signal (same broadcast channel the receiver and
+/// path-warmer already subscribe to in the mobile crate). Racing it against
+/// `process_queue` too — not just the idle sleep — matters because a single
+/// large send can hold `process_queue` for up to ~20 minutes (the readiness-gate
+/// wait plus QUIC delivery); a stop branch only on the sleep would leave this
+/// task holding the storage/QUIC/Core `Arc`s for that long after `stop()`
+/// returns. Cancelling mid-`process_queue` is safe to do: `queue_delete` only
+/// runs on the `Ok(())` arm, so a cancelled send leaves the queue row and
+/// Outbox mail intact and simply retries on next start. There is a narrow
+/// window where a peer accepted the mail but we were cancelled before
+/// de-queueing, producing a duplicate on restart; the receiver side already
+/// dedups via `mail_insert_inbox_dedup`.
 pub fn spawn(
     storage: Arc<SqliteStorage>,
     quic: Arc<QuicMailTransport>,
     core: Arc<Core>,
     base_interval: Duration,
+    mut stop: broadcast::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = base_interval;
@@ -28,20 +43,26 @@ pub fn spawn(
 
         let notify = storage.queue_notify();
         loop {
-            match process_queue(&storage, &quic, &core).await {
-                Ok(()) => {
-                    // ponytail: success → back to base interval
-                    interval = Duration::from_secs(30);
-                }
-                Err(_) => {
-                    // ponytail: failure or deferred (no up peer) → fast retry (10s)
-                    interval = Duration::from_secs(10);
+            tokio::select! {
+                _ = stop.recv() => break,
+                result = process_queue(&storage, &quic, &core) => {
+                    match result {
+                        Ok(()) => {
+                            // ponytail: success → back to base interval
+                            interval = Duration::from_secs(30);
+                        }
+                        Err(_) => {
+                            // ponytail: failure or deferred (no up peer) → fast retry (10s)
+                            interval = Duration::from_secs(10);
+                        }
+                    }
                 }
             }
             // Wake immediately when new mail is enqueued (queue_insert fires the
             // notify), else fall back to the poll interval. Notify stores a permit
             // if the enqueue happened while we were mid-process, so no wake is lost.
             tokio::select! {
+                _ = stop.recv() => break,
                 _ = tokio::time::sleep(interval) => {}
                 _ = notify.notified() => {}
             }
@@ -208,6 +229,9 @@ fn deliver_to_self(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core_conn::testutil::MemPacketConn;
+    use ed25519_dalek::SigningKey;
+    use ironwood::types::PacketConn;
 
     fn temp_db(name: &str) -> SqliteStorage {
         let path = std::env::temp_dir().join(format!(
@@ -248,5 +272,82 @@ mod tests {
             !storage.mail_list("Sent").unwrap().is_empty(),
             "the last recipient moves the mail to Sent"
         );
+    }
+
+    fn test_core(seed: u8) -> Arc<Core> {
+        // Core::new is synchronous and binds no sockets — init_links()/start()
+        // are never called, so this is a plain in-memory node for tests.
+        let key = SigningKey::from_bytes(&[seed; 32]);
+        Core::new(key, yggdrasil::config::Config::default())
+    }
+
+    fn test_quic(seed_a: u8, seed_b: u8) -> Arc<QuicMailTransport> {
+        let key_a = SigningKey::from_bytes(&[seed_a; 32]);
+        let key_b = SigningKey::from_bytes(&[seed_b; 32]);
+        let (conn_a, _conn_b) = MemPacketConn::pair(key_a.clone(), key_b);
+        QuicMailTransport::new(conn_a as Arc<dyn PacketConn>, &key_a).unwrap()
+    }
+
+    /// Task 14: `stop` must terminate the sender while it is idling in the
+    /// sleep(interval)/notify select — the branch the brief names directly.
+    /// Empty queue → `process_queue` returns immediately, parking the loop in
+    /// the second select before the signal is sent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_signal_terminates_sender_idling_in_the_sleep() {
+        let storage = Arc::new(temp_db("stop_idle"));
+        let quic = test_quic(0x51, 0x52);
+        let core = test_core(0x53);
+
+        let (stop_tx, stop_rx) = broadcast::channel(1);
+        let handle = spawn(storage, quic, core, Duration::from_secs(30), stop_rx);
+
+        // Past the 2s startup delay, with an empty queue process_queue()
+        // returns at once, so by now the loop is parked in sleep(30s)/notify.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        stop_tx.send(()).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("sender must exit promptly after stop while idling in sleep()")
+            .expect("sender task must not panic");
+    }
+
+    /// Task 14, ruling 2: a stop branch on the sleep alone is not enough —
+    /// `process_queue` itself can block for up to ~20s in `wait_for_up_peer`
+    /// (longer still with Task 13's size-scaled dialog budget once a send is
+    /// underway). Queue mail to a destination that never comes "up" so
+    /// `process_queue` is genuinely parked inside that wait, then confirm the
+    /// signal cuts it short well before the 20s readiness deadline.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_signal_terminates_sender_blocked_in_process_queue() {
+        let storage = Arc::new(temp_db("stop_mid_process"));
+        let quic = test_quic(0x61, 0x62);
+        let core = test_core(0x63);
+
+        let dest = [0x99u8; 32];
+        let dest_hex = hex::encode(dest);
+        let from = crate::address::create_address(core.public_key());
+        let to = crate::address::create_address(&dest);
+        let id = storage
+            .mail_insert("Outbox", b"Subject: never delivered\r\n\r\nhi\r\n")
+            .unwrap();
+        storage
+            .queue_insert(&dest_hex, "Outbox", id, &from, &to)
+            .unwrap();
+
+        let (stop_tx, stop_rx) = broadcast::channel(1);
+        let handle = spawn(storage, quic, core, Duration::from_secs(30), stop_rx);
+
+        // Past the 2s startup delay and into wait_for_up_peer's up-to-20s wait
+        // (no peer will ever come up in this test).
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        stop_tx.send(()).unwrap();
+
+        // READINESS_WAIT is 20s — a prompt exit here proves cancellation cut
+        // process_queue short rather than letting it run to its own timeout.
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("sender must exit promptly even while blocked inside process_queue")
+            .expect("sender task must not panic");
     }
 }
