@@ -13,7 +13,7 @@ mod smtp_overlay;
 mod transport;
 mod udp_adapter;
 
-pub use transport::{QuicMailError, QuicMailTransport};
+pub use transport::{DurabilityAck, InboundMail, QuicMailError, QuicMailTransport};
 
 use std::sync::Arc;
 use std::time::Duration;

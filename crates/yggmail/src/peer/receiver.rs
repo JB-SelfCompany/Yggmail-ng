@@ -23,13 +23,23 @@ pub fn spawn(
             let received = match &ymp {
                 Some(ymp) => tokio::select! {
                     r = quic.recv() => r.map_err(|e| format!("QUIC: {e}")),
-                    r = ymp.recv() => r.map_err(|e| format!("YMP: {e}")),
+                    // У YMP нет квитанции в проводе: отправитель уже считает
+                    // письмо доставленным, подтверждать некому и нечего.
+                    r = ymp.recv() => r.map(|(k, d)| (k, d, None)).map_err(|e| format!("YMP: {e}")),
                 },
                 None => quic.recv().await.map_err(|e| format!("QUIC: {e}")),
             };
 
             match received {
-                Ok((from_key, data)) => store(&storage, from_key, &data),
+                Ok((from_key, data, ack)) => {
+                    // Подтверждение — только после укладки: пир держит стрим
+                    // открытым и получит `250` ровно от этого `send`.
+                    if store(&storage, from_key, &data) {
+                        if let Some(ack) = ack {
+                            let _ = ack.send(());
+                        }
+                    }
+                }
                 Err(e) => {
                     tracing::error!("receiver: recv error: {e}");
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -39,7 +49,10 @@ pub fn spawn(
     })
 }
 
-fn store(storage: &SqliteStorage, from_key: [u8; 32], data: &[u8]) {
+/// Уложить письмо. `true` — письмо durable, то есть отправителю можно
+/// подтверждать приём. Дубликат тоже durable: он уже лежит в INBOX с прошлой
+/// доставки, и заставлять пира слать его снова не за чем.
+fn store(storage: &SqliteStorage, from_key: [u8; 32], data: &[u8]) -> bool {
     let from_addr = crate::address::create_address(&from_key);
     match storage.mail_insert_inbox_dedup(&from_key, data) {
         Ok(Some(id)) => {
@@ -48,12 +61,15 @@ fn store(storage: &SqliteStorage, from_key: [u8; 32], data: &[u8]) {
                 &from_addr[..16],
                 data.len()
             );
+            true
         }
         Ok(None) => {
             tracing::debug!("receiver: duplicate mail from {} dropped", &from_addr[..16]);
+            true
         }
         Err(e) => {
             tracing::error!("receiver: failed to store mail: {e}");
+            false
         }
     }
 }

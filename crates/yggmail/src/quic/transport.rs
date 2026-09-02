@@ -12,9 +12,11 @@ use ed25519_dalek::SigningKey;
 use ironwood::types::PacketConn;
 use quinn::Connection;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
-use super::smtp_overlay::{OverlayError, overlay_send_stream, overlay_serve_stream};
+use super::smtp_overlay::{
+    OverlayError, overlay_send_stream, overlay_serve_stream, write_data_reply,
+};
 use super::{QuicOverlay, peer_key};
 use crate::address::create_address;
 
@@ -49,6 +51,30 @@ const DIALOG_TIMEOUT: Duration = Duration::from_secs(120);
 /// `DIAL_TIMEOUT` — этот бюджет расширяет только диалог с уже дозвонившимся,
 /// живым, но медленным пиром.
 const MIN_THROUGHPUT: u64 = 32 * 1024;
+
+/// Сколько входящий диалог ждёт подтверждения укладки, прежде чем ответить
+/// `451`. Работы здесь на один INSERT в локальную SQLite; бюджет с запасом
+/// покрывает и заблокированную на секунды базу, и потребителя, который в этот
+/// момент дожёвывает предыдущее письмо. Всё, что дольше, означает, что
+/// потребитель `recv()` встал или его вовсе нет — тогда честнее сказать пиру
+/// `451` и дать ему повторить, чем держать стрим открытым до конца бюджета
+/// диалога. Держится ниже `DIALOG_TIMEOUT` (120с) с обеих сторон: пир 1.8
+/// должен получить наш ответ раньше, чем сам сдастся по таймауту.
+const DURABILITY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Подтверждение долговечности: потребитель шлёт `()` после того, как письмо
+/// уложено в INBOX (или признано дубликатом — оно durable уже с прошлой
+/// доставки). Уронить отправитель, не послав ничего, — это «не уложено», и
+/// диалог отвечает пиру `451`.
+pub type DurabilityAck = oneshot::Sender<()>;
+
+/// Входящее письмо: ключ отправителя, сырой RFC 5322 и подтверждение укладки.
+///
+/// Подтверждение — `Option`, потому что YMP его не требует: у того протокола
+/// нет квитанции в проводе, подтверждать нечего, и его ветка в `select!`
+/// подставляет `None`. Для QUIC он всегда `Some`, и потребитель обязан его
+/// отправить, иначе пир получит `451` и доставит письмо ещё раз.
+pub type InboundMail = ([u8; 32], Vec<u8>, Option<DurabilityAck>);
 
 /// Эффективный бюджет диалога для письма данного размера: фиксированные
 /// накладные расходы плюс время на передачу тела при `MIN_THROUGHPUT`.
@@ -87,7 +113,7 @@ pub struct QuicMailTransport {
     local_key: [u8; 32],
     conns: AsyncMutex<HashMap<[u8; 32], Connection>>,
     active_peers: AsyncMutex<HashMap<[u8; 32], Instant>>,
-    recv_rx: AsyncMutex<mpsc::Receiver<([u8; 32], Vec<u8>)>>,
+    recv_rx: AsyncMutex<mpsc::Receiver<InboundMail>>,
 }
 
 impl QuicMailTransport {
@@ -184,18 +210,11 @@ impl QuicMailTransport {
                         };
                         let tx = tx.clone();
                         tokio::spawn(async move {
-                            match serve_one_stream(recv, send, local_key, pk).await {
-                                Ok((from, mail)) => {
-                                    if tx.send((from, mail)).await.is_err() {
-                                        tracing::debug!("quic: recv queue closed");
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "quic: inbound dialog from {} failed: {e}",
-                                        hex::encode(&pk[..8])
-                                    );
-                                }
+                            if let Err(e) = serve_one_stream(recv, send, local_key, pk, tx).await {
+                                tracing::warn!(
+                                    "quic: inbound dialog from {} failed: {e}",
+                                    hex::encode(&pk[..8])
+                                );
                             }
                         });
                     }
@@ -272,8 +291,13 @@ impl QuicMailTransport {
         Ok(())
     }
 
-    /// Получить следующее входящее письмо: `(ключ отправителя, RFC 5322)`.
-    pub async fn recv(&self) -> Result<([u8; 32], Vec<u8>), QuicMailError> {
+    /// Получить следующее входящее письмо: `(ключ отправителя, RFC 5322,
+    /// подтверждение укладки)`.
+    ///
+    /// Пир всё ещё ждёт ответа на DATA. Отправить подтверждение — обязанность
+    /// вызывающего, и только после того, как письмо реально уложено: пока
+    /// подтверждения нет, пир не получит `250` и не снимет свою копию.
+    pub async fn recv(&self) -> Result<InboundMail, QuicMailError> {
         self.recv_rx
             .lock()
             .await
@@ -367,22 +391,48 @@ impl QuicMailTransport {
     }
 }
 
-/// Съесть kick-байт и провести серверный диалог на одном стриме.
+/// Съесть kick-байт, провести серверный диалог на одном стриме и ответить на
+/// DATA только после того, как потребитель подтвердил укладку письма.
+///
+/// Отдать письмо в канал и дождаться подтверждения — часть диалога, а не то,
+/// что делают с его результатом: пир всё это время держит стрим открытым и
+/// ждёт ответа. Раньше `250` уходил здесь же, а укладка случалась двумя
+/// задачами позже, и на `stop()` очередь на 64 письма роняли вместе с
+/// содержимым — пир уже снял свою копию.
 async fn serve_one_stream(
     mut recv: quinn::RecvStream,
-    send: quinn::SendStream,
+    mut send: quinn::SendStream,
     local_key: [u8; 32],
     peer: [u8; 32],
-) -> Result<([u8; 32], Vec<u8>), QuicMailError> {
+    tx: mpsc::Sender<InboundMail>,
+) -> Result<(), QuicMailError> {
     let mut kick = [0u8; 1];
     recv.read_exact(&mut kick)
         .await
         .map_err(|e| QuicMailError::Transport(format!("kick byte: {e}")))?;
     tracing::info!("quic: stream open, kick consumed from {}", hex::encode(&peer[..8]));
 
-    let (from, mail) = overlay_serve_stream(recv, send, local_key, peer).await?;
+    let (from, mail) = overlay_serve_stream(recv, &mut send, local_key, peer).await?;
     tracing::info!("smtp-overlay: DATA {} bytes from {}", mail.len(), hex::encode(&peer[..8]));
-    Ok((from, mail))
+
+    // Общий бюджет на «отдать и дождаться»: очередь может быть забита ровно
+    // потому, что потребитель встал, — тогда ждать на `send()` так же вредно,
+    // как ждать на подтверждении.
+    let (ack_tx, ack_rx) = oneshot::channel();
+    let durable = tokio::time::timeout(DURABILITY_TIMEOUT, async move {
+        tx.send((from, mail, Some(ack_tx))).await.is_ok() && ack_rx.await.is_ok()
+    })
+    .await
+    .unwrap_or(false);
+
+    if !durable {
+        tracing::error!(
+            "quic: mail from {} not stored, answering 451",
+            hex::encode(&peer[..8])
+        );
+    }
+    write_data_reply(&mut send, durable).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -390,6 +440,28 @@ mod tests {
     use super::*;
     use crate::core_conn::testutil::MemPacketConn;
     use ed25519_dalek::SigningKey;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Фоновый потребитель входящих писем, подтверждающий укладку — та же
+    /// роль, что у `peer::receiver`. Без него `send()` не дождётся `250`:
+    /// пир держит стрим до подтверждения. Отданные письма складываются в
+    /// канал, чтобы тест мог их проверить.
+    fn spawn_acking_consumer(
+        transport: Arc<QuicMailTransport>,
+    ) -> mpsc::UnboundedReceiver<([u8; 32], Vec<u8>)> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((from, mail, ack)) = transport.recv().await {
+                if let Some(ack) = ack {
+                    let _ = ack.send(());
+                }
+                if tx.send((from, mail)).is_err() {
+                    return;
+                }
+            }
+        });
+        rx
+    }
 
     /// Сквозной путь поверх mesh-адаптера: `send()` у одного узла даёт `recv()`
     /// у другого с телом письма и ключом отправителя. Это тот самый
@@ -406,10 +478,12 @@ mod tests {
         let alice = QuicMailTransport::new(conn_a as Arc<dyn PacketConn>, &key_a).unwrap();
         let bob = QuicMailTransport::new(conn_b as Arc<dyn PacketConn>, &key_b).unwrap();
 
+        let mut bob_rx = spawn_acking_consumer(bob);
+
         let mail = b"Subject: Meshmail\r\nFrom: a\r\n\r\nHello over QUIC\r\n".to_vec();
         alice.send(pub_b, mail.clone()).await.expect("send ok");
 
-        let (from, got) = tokio::time::timeout(std::time::Duration::from_secs(10), bob.recv())
+        let (from, got) = tokio::time::timeout(std::time::Duration::from_secs(10), bob_rx.recv())
             .await
             .expect("recv did not time out")
             .expect("recv ok");
@@ -432,15 +506,21 @@ mod tests {
         let alice = QuicMailTransport::new(conn_a as Arc<dyn PacketConn>, &key_a).unwrap();
         let bob = QuicMailTransport::new(conn_b as Arc<dyn PacketConn>, &key_b).unwrap();
 
+        let mut bob_rx = spawn_acking_consumer(bob);
+
         alice.send(pub_b, b"Subject: one\r\n\r\n1\r\n".to_vec()).await.unwrap();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), bob.recv()).await.unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), bob_rx.recv())
+            .await
+            .unwrap();
         let first_id = alice
             .cached_connection_stable_id(pub_b)
             .await
             .expect("connection cached after first send");
 
         alice.send(pub_b, b"Subject: two\r\n\r\n2\r\n".to_vec()).await.unwrap();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), bob.recv()).await.unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), bob_rx.recv())
+            .await
+            .unwrap();
         let second_id = alice
             .cached_connection_stable_id(pub_b)
             .await
@@ -464,8 +544,12 @@ mod tests {
         let alice = QuicMailTransport::new(conn_a as Arc<dyn PacketConn>, &key_a).unwrap();
         let bob = QuicMailTransport::new(conn_b as Arc<dyn PacketConn>, &key_b).unwrap();
 
+        let mut bob_rx = spawn_acking_consumer(bob);
+
         alice.send(pub_b, b"Subject: x\r\n\r\nx\r\n".to_vec()).await.unwrap();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), bob.recv()).await.unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), bob_rx.recv())
+            .await
+            .unwrap();
 
         let recent = alice.recent_peers(std::time::Duration::from_secs(60)).await;
         assert!(recent.contains(&pub_b), "peer must be tracked as recently active");
@@ -625,6 +709,105 @@ mod tests {
         );
     }
 
+    /// `250` уходит только после подтверждения укладки. Потребитель здесь
+    /// подтверждает не мгновенно: если бы диалог отвечал `250` сразу после
+    /// DATA, `send()` вернулся бы раньше, чем выставлен флаг — то есть пир
+    /// счёл бы доставленным письмо, которого ещё нигде нет.
+    #[tokio::test(start_paused = true)]
+    async fn data_reply_waits_for_the_durability_ack() {
+        let key_a = SigningKey::from_bytes(&[51u8; 32]);
+        let key_b = SigningKey::from_bytes(&[52u8; 32]);
+        let pub_a = key_a.verifying_key().to_bytes();
+        let pub_b = key_b.verifying_key().to_bytes();
+
+        let (conn_a, conn_b) = MemPacketConn::pair(key_a.clone(), key_b.clone());
+        let alice = QuicMailTransport::new(conn_a as Arc<dyn PacketConn>, &key_a).unwrap();
+        let bob = QuicMailTransport::new(conn_b as Arc<dyn PacketConn>, &key_b).unwrap();
+
+        let stored = Arc::new(AtomicBool::new(false));
+        let flag = stored.clone();
+        tokio::spawn(async move {
+            let (from, mail, ack) = bob.recv().await.expect("recv ok");
+            assert_eq!(from, pub_a, "receiver must see the sender's key");
+            assert!(!mail.is_empty(), "body delivered");
+            // «Укладка»: занимает время, как настоящий INSERT.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            flag.store(true, Ordering::SeqCst);
+            ack.expect("QUIC mail must carry a durability ack")
+                .send(())
+                .expect("dialog must still be waiting for the ack");
+        });
+
+        alice
+            .send(pub_b, b"Subject: x\r\n\r\nbody\r\n".to_vec())
+            .await
+            .expect("send must succeed once the mail is durable");
+
+        assert!(
+            stored.load(Ordering::SeqCst),
+            "sender saw 250 before the receiver stored the mail"
+        );
+    }
+
+    /// Потребитель забрал письмо, но подтверждения не послал — так выглядит
+    /// провалившаяся укладка (`Err` из `mail_insert_inbox_dedup`). Пир обязан
+    /// получить `451` и повторить, а не `250` на письмо, которого нет.
+    #[tokio::test]
+    async fn dropped_ack_answers_451_instead_of_250() {
+        let key_a = SigningKey::from_bytes(&[53u8; 32]);
+        let key_b = SigningKey::from_bytes(&[54u8; 32]);
+        let pub_b = key_b.verifying_key().to_bytes();
+
+        let (conn_a, conn_b) = MemPacketConn::pair(key_a.clone(), key_b.clone());
+        let alice = QuicMailTransport::new(conn_a as Arc<dyn PacketConn>, &key_a).unwrap();
+        let bob = QuicMailTransport::new(conn_b as Arc<dyn PacketConn>, &key_b).unwrap();
+
+        tokio::spawn(async move {
+            let (_from, _mail, ack) = bob.recv().await.expect("recv ok");
+            drop(ack);
+        });
+
+        let err = alice
+            .send(pub_b, b"Subject: x\r\n\r\nbody\r\n".to_vec())
+            .await
+            .expect_err("send must fail when the receiver could not store the mail");
+        assert!(
+            format!("{err}").contains("451"),
+            "peer must be answered 451, never 250, got {err}"
+        );
+    }
+
+    /// Пир не должен увидеть `250` на DATA, пока письмо не уложено. Здесь
+    /// потребитель `recv()` не запущен вовсе — ровно то, что происходит при
+    /// `stop()`: письмо остаётся в канале и никогда не доходит до INBOX.
+    /// Диалог обязан ответить `451`, чтобы пир повторил доставку, а не
+    /// отрапортовать `250` о письме, которое никто не уложил.
+    #[tokio::test(start_paused = true)]
+    async fn data_without_durability_ack_fails_instead_of_reporting_250() {
+        let key_a = SigningKey::from_bytes(&[47u8; 32]);
+        let key_b = SigningKey::from_bytes(&[48u8; 32]);
+        let pub_b = key_b.verifying_key().to_bytes();
+
+        let (conn_a, conn_b) = MemPacketConn::pair(key_a.clone(), key_b.clone());
+        let alice = QuicMailTransport::new(conn_a as Arc<dyn PacketConn>, &key_a).unwrap();
+        // Транспорт получателя жив и принимает диалог, но recv() никто не
+        // вызывает — подтверждения долговечности не будет.
+        let _bob = QuicMailTransport::new(conn_b as Arc<dyn PacketConn>, &key_b).unwrap();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(300),
+            alice.send(pub_b, b"Subject: x\r\n\r\nbody\r\n".to_vec()),
+        )
+        .await
+        .expect("send must not hang past the 300s test safety bound");
+
+        let err = outcome.expect_err("send must fail when the mail was never stored");
+        assert!(
+            format!("{err}").contains("451"),
+            "peer must be answered 451, never 250, got {err}"
+        );
+    }
+
     /// Пир, чей сертификат заявляет чужой ключ, должен быть отвергнут.
     ///
     /// Сертификат ничего не доказывает: общий верификатор возвращает
@@ -654,7 +837,7 @@ mod tests {
         assert!(
             got.is_err(),
             "spoofed peer must not deliver mail, got {:?}",
-            got.map(|r| r.map(|(k, _)| hex::encode(k)))
+            got.map(|r| r.map(|(k, _, _)| hex::encode(k)))
         );
     }
 }

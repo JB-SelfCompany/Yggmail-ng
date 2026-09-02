@@ -222,27 +222,43 @@ impl YggmailMobile {
                         msg = async {
                             tokio::select! {
                                 r = rx_quic.recv() => r.map_err(|e| e.to_string()),
-                                r = rx_ymp.recv() => r.map_err(|e| e.to_string()),
+                                // YMP carries no durability receipt — nothing to
+                                // acknowledge, hence `None`.
+                                r = rx_ymp.recv() => r.map(|(k, d)| (k, d, None)).map_err(|e| e.to_string()),
                             }
                         } => {
                             match msg {
-                                Ok((from_key, data)) => {
+                                Ok((from_key, data, ack)) => {
                                     tracing::info!("mobile: received mail, {} bytes", data.len());
-                                    match rx_storage.mail_insert_inbox_dedup(&from_key, &data) {
+                                    // The QUIC peer is still holding the DATA stream
+                                    // open: it sees 250 only once `ack` is sent, and
+                                    // 451 (retry later) if it never is. Acknowledge
+                                    // strictly after the insert returned.
+                                    let durable = match rx_storage.mail_insert_inbox_dedup(&from_key, &data) {
                                         Ok(Some(id)) => {
                                             tracing::info!("mobile: stored in INBOX id={}", id);
                                             // Notify IMAP IDLE clients (Delta Chat)
                                             let _ = rx_imap_notify.send(());
+                                            true
                                         }
                                         Ok(None) => {
                                             tracing::debug!(
                                                 "mobile: duplicate mail from {} dropped",
                                                 hex::encode(from_key)
                                             );
-                                            // No IDLE notify — duplicate was not stored
+                                            // No IDLE notify — duplicate was not stored.
+                                            // Still durable: it is in INBOX from the
+                                            // earlier delivery, so the peer is done.
+                                            true
                                         }
                                         Err(e) => {
                                             tracing::error!("mail_insert error: {e}");
+                                            false
+                                        }
+                                    };
+                                    if durable {
+                                        if let Some(ack) = ack {
+                                            let _ = ack.send(());
                                         }
                                     }
                                 }

@@ -54,9 +54,15 @@ impl From<std::io::Error> for OverlayError {
 /// Письмо возвращается ровно как получено: трассировочные заголовки не
 /// добавляются, иначе отпечаток `hash(from_key, raw)` в
 /// `mail_insert_inbox_dedup` станет уникальным на каждой повторной доставке.
+///
+/// Финальный ответ на DATA здесь **не пишется**: письмо на этот момент ещё
+/// нигде не лежит. Его пишет вызывающий через `write_data_reply` — уже зная,
+/// стало ли письмо durable. Поэтому `writer` берётся по `&mut`: он нужен
+/// вызывающему после возврата. Все остальные ответы (greeting, MAIL/RCPT, 354
+/// и любые коды ошибок) по-прежнему выдаёт сам диалог.
 pub(crate) async fn overlay_serve_stream<R, W>(
     reader: R,
-    mut writer: W,
+    writer: &mut W,
     local_key: [u8; 32],
     peer_key: [u8; 32],
 ) -> Result<([u8; 32], Vec<u8>), OverlayError>
@@ -116,11 +122,9 @@ where
             writer.write_all(b"354 go ahead\r\n").await?;
             writer.flush().await?;
             match read_data(&mut reader).await {
-                Ok(body) => {
-                    writer.write_all(b"250 OK\r\n").await?;
-                    writer.flush().await?;
-                    return Ok((peer_key, body));
-                }
+                // Ответа тут нет намеренно: письмо ещё не уложено. См.
+                // `write_data_reply`.
+                Ok(body) => return Ok((peer_key, body)),
                 Err(OverlayError::TooLarge) => {
                     // 552 — тот же код, которым отвечает Go-сторона.
                     let _ = writer.write_all(b"552 message size limit exceeded\r\n").await;
@@ -138,6 +142,26 @@ where
         }
         writer.flush().await?;
     }
+}
+
+/// Написать финальный ответ на DATA — после того, как судьба письма известна.
+///
+/// `durable == true` → `250`: письмо в INBOX, пир вправе снять свою копию.
+/// `durable == false` → `451`: транзиентный отказ, пир повторит доставку
+/// позже. Именно `451`, а не `250`: 250 о неулаженном письме — это молчаливая
+/// потеря почты, потому что пир на нём свою копию удалит.
+pub(crate) async fn write_data_reply<W>(writer: &mut W, durable: bool) -> Result<(), OverlayError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let reply: &[u8] = if durable {
+        b"250 OK\r\n"
+    } else {
+        b"451 4.3.0 mail not stored, try again later\r\n"
+    };
+    writer.write_all(reply).await?;
+    writer.flush().await?;
+    Ok(())
 }
 
 /// Прочитать одну строку до `\n` включительно, с потолком длины `cap`.
@@ -350,12 +374,19 @@ mod tests {
 
         let (client_side, server_side) = tokio::io::duplex(64 * 1024);
         let (cr, cw) = split(client_side);
-        let (sr, sw) = split(server_side);
+        let (sr, mut sw) = split(server_side);
 
         let body = "Subject: Hi\r\nFrom: test\r\n\r\nPayload line\r\n";
 
-        let server =
-            tokio::spawn(async move { overlay_serve_stream(sr, sw, recipient_key, sender_key).await });
+        // Как в бою: диалог отдаёт письмо, финальный `250` пишет вызывающий —
+        // здесь сразу, потому что письму в тесте некуда укладываться.
+        let server = tokio::spawn(async move {
+            let r = overlay_serve_stream(sr, &mut sw, recipient_key, sender_key).await;
+            if r.is_ok() {
+                write_data_reply(&mut sw, true).await.unwrap();
+            }
+            r
+        });
         let client = tokio::spawn(async move {
             overlay_send_stream(cr, cw, &hex::encode(sender_key), &addr(&sender_key), &[addr(&recipient_key)], body.as_bytes())
                 .await
@@ -376,11 +407,13 @@ mod tests {
         let recipient_key = [0x44u8; 32];
 
         let (client_side, server_side) = tokio::io::duplex(64 * 1024);
-        let (sr, sw) = split(server_side);
+        let (sr, mut sw) = split(server_side);
         let (_cr, mut cw) = split(client_side);
 
         let server =
-            tokio::spawn(async move { overlay_serve_stream(sr, sw, recipient_key, sender_key).await });
+            tokio::spawn(
+                async move { overlay_serve_stream(sr, &mut sw, recipient_key, sender_key).await },
+            );
 
         cw.write_all(b"EHLO yggmail\r\n").await.unwrap();
         cw.write_all(format!("MAIL FROM:<{}> SIZE=4096\r\n", addr(&sender_key)).as_bytes())
@@ -404,11 +437,13 @@ mod tests {
         let recipient_key = [0x66u8; 32];
 
         let (client_side, server_side) = tokio::io::duplex(64 * 1024);
-        let (sr, sw) = split(server_side);
+        let (sr, mut sw) = split(server_side);
         let (_cr, mut cw) = split(client_side);
 
         let server =
-            tokio::spawn(async move { overlay_serve_stream(sr, sw, recipient_key, sender_key).await });
+            tokio::spawn(
+                async move { overlay_serve_stream(sr, &mut sw, recipient_key, sender_key).await },
+            );
 
         cw.write_all(b"EHLO yggmail\r\n").await.unwrap();
         cw.write_all(format!("MAIL FROM:<{}@yggmail.local>\r\n", hex::encode(sender_key)).as_bytes())
@@ -432,15 +467,20 @@ mod tests {
 
         let (client_side, server_side) = tokio::io::duplex(64 * 1024);
         let (cr, cw) = split(client_side);
-        let (sr, sw) = split(server_side);
+        let (sr, mut sw) = split(server_side);
 
         let mut body = b"Subject: bin\r\n\r\n".to_vec();
         body.extend_from_slice(&[0xFF, 0xFE, 0x00, 0x80, 0xC3]);
         body.extend_from_slice(b"\r\n");
         let expected = body.clone();
 
-        let server =
-            tokio::spawn(async move { overlay_serve_stream(sr, sw, recipient_key, sender_key).await });
+        let server = tokio::spawn(async move {
+            let r = overlay_serve_stream(sr, &mut sw, recipient_key, sender_key).await;
+            if r.is_ok() {
+                write_data_reply(&mut sw, true).await.unwrap();
+            }
+            r
+        });
         let client = tokio::spawn(async move {
             overlay_send_stream(cr, cw, &hex::encode(sender_key), &addr(&sender_key), &[addr(&recipient_key)], &body).await
         });
@@ -463,10 +503,12 @@ mod tests {
 
         let (client_side, server_side) = tokio::io::duplex(64 * 1024);
         let (cr, cw) = split(client_side);
-        let (sr, sw) = split(server_side);
+        let (sr, mut sw) = split(server_side);
 
         let server =
-            tokio::spawn(async move { overlay_serve_stream(sr, sw, [0x22u8; 32], peer_key).await });
+            tokio::spawn(
+                async move { overlay_serve_stream(sr, &mut sw, [0x22u8; 32], peer_key).await },
+            );
         let _client = tokio::spawn(async move {
             overlay_send_stream(
                 cr,
@@ -490,11 +532,13 @@ mod tests {
         let recipient_key = [0xBBu8; 32];
 
         let (client_side, server_side) = tokio::io::duplex(1024 * 1024);
-        let (sr, sw) = split(server_side);
+        let (sr, mut sw) = split(server_side);
         let (_cr, mut cw) = split(client_side);
 
         let server =
-            tokio::spawn(async move { overlay_serve_stream(sr, sw, recipient_key, sender_key).await });
+            tokio::spawn(
+                async move { overlay_serve_stream(sr, &mut sw, recipient_key, sender_key).await },
+            );
 
         cw.write_all(b"EHLO yggmail\r\n").await.unwrap();
         cw.write_all(format!("MAIL FROM:<{}>\r\n", addr(&sender_key)).as_bytes()).await.unwrap();
