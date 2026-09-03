@@ -129,7 +129,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .map_err(|e| format!("quic overlay: {e}"))?;
 
     // ── Peer exchange ─────────────────────────────────────────────────
-    let _receiver = peer::receiver::spawn(storage.clone(), quic.clone(), Some(ymp.clone()));
+    // IDLE notify channel: both inbound paths fire it — the receiver on network
+    // delivery, the sender on self-send. Created here because both peer tasks
+    // start before the IMAP server does.
+    let (imap_notify_tx, _) = tokio::sync::broadcast::channel::<()>(16);
+    let _receiver = peer::receiver::spawn(
+        storage.clone(),
+        quic.clone(),
+        Some(ymp.clone()),
+        imap_notify_tx.clone(),
+    );
     // ponytail: the binary never stops the sender early (it runs until process
     // exit), so this channel never fires — but `_stop_tx` must be a named
     // binding, not `_`. A bare `_` drops the sender end on the spot, and
@@ -144,6 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         core.clone(),
         tokio::time::Duration::from_secs(30),
         stop_rx,
+        imap_notify_tx.clone(),
     );
 
     // ── SMTP ──────────────────────────────────────────────────────────
@@ -157,10 +167,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // ── IMAP ──────────────────────────────────────────────────────────
-    // ponytail: IDLE notify channel. Binary receiver (peer::receiver::spawn)
-    // doesn't send notifications yet — IDLE clients rely on reconnect poll.
-    // Channel kept so serve() signature matches the mobile path.
-    let (imap_notify_tx, _) = tokio::sync::broadcast::channel::<()>(16);
     let imap_storage = storage.clone();
     let _imap = tokio::spawn(async move {
         if let Err(e) = yggmail::imap::serve(

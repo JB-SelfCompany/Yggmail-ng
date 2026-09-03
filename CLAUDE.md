@@ -26,7 +26,7 @@ Windows MSVC target uses `rust-lld` via `.cargo/config.toml` (Git Bash shadows t
 ## Architecture
 
 ```
-MUA (Thunderbird) ←SMTP:1025/IMAP:1143→ yggmail ←YMP→ Yggdrasil mesh ←→ peers
+MUA (Thunderbird) ←SMTP:1025/IMAP:1143→ yggmail ←QUIC (+YMP)→ Yggdrasil mesh ←→ peers
                                                │
                                           SQLite (yggmail.db)
 ```
@@ -44,11 +44,12 @@ Both reference `Yggdrasil-ng` at `../../../Yggdrasil-ng/crates/{ironwood,yggdras
 
 | Module | Role |
 |--------|------|
-| `ymp/` | Yggdrasil Mail Protocol — fragmentation, ACK, retransmission over `PacketConn` |
-| `core_conn.rs` | Adapter that wraps `yggdrasil::Core` as `ironwood::PacketConn` trait |
+| `quic/` | QUIC mail overlay — wire-compatible with yggmail 1.8 (Go); the transport outbound mail uses |
+| `ymp/` | Yggdrasil Mail Protocol — fragmentation, ACK, retransmission over `PacketConn`. Inbound only now, kept for already-deployed 1.9.0 nodes |
+| `core_conn.rs` | Adapter that wraps `yggdrasil::Core` as `ironwood::PacketConn` trait; `demux()` splits datagrams between YMP and QUIC |
 | `storage/` | SQLite via rusqlite, schema-compatible with yggmail_old |
-| `peer/sender.rs` | Background poll loop: reads `queue` table → `YmpSession::send()` |
-| `peer/receiver.rs` | Background loop: `YmpSession::recv()` → INBOX |
+| `peer/sender.rs` | Background poll loop: reads `queue` table → `QuicMailTransport::send()` |
+| `peer/receiver.rs` | Background loop: QUIC (and YMP) → INBOX |
 | `smtp/` | Self-written ESMTP server (~200 lines), localhost:1025 only |
 | `imap/` | Self-written IMAP4rev1 server (~500 lines), localhost:1143 only |
 | `address.rs` | `hex(pubkey)@yggmail` parse/create |
@@ -61,14 +62,16 @@ Wire format: `type(1) | msg_id(8 BE) | seq(2 BE) | total(2 BE) | payload_len(2 B
 - `0x10` = DATA, `0x11` = ACK. FRAGMENT_SIZE = 65520. Max message = 32 MiB.
 - Per-segment ACK (not cumulative) — Yggdrasil allows out-of-order packet delivery.
 - `YmpSession::send()` blocks until all ACKs received or 5 retries exhausted (30s timeout each).
-- Background reader spawned in `YmpSession::new()` — single consumer of `Core::read_from()`.
+- Background reader spawned in `YmpSession::new()` — reads the YMP half of `core_conn::demux()`.
 
 ### CoreConn adapter
 
 `Core` doesn't implement `ironwood::PacketConn` directly. `CoreConn` bridges it:
 - `read_from`/`write_to` delegate to `Core` (which handles type-byte dispatch: 0x01=traffic, 0x02=proto)
 - `is_closed()` stubbed to `false` (Core doesn't expose it)
-- YMP is the **sole consumer** of `Core::read_from()` — no competition for the internal mpsc channel
+- `demux()` is the **sole consumer** of `Core::read_from()`: one pump splits each datagram
+  between YMP and QUIC by the QUIC Fixed Bit and feeds two queues, so the two transports never
+  compete for the internal mpsc channel. It goes away with YMP, and `CoreConn` then feeds QUIC directly.
 
 ### Storage schema
 
@@ -81,7 +84,12 @@ Tables: `mails`, `mailboxes`, `queue`, `config`. Key details:
 ## Design decisions
 
 - **No external SMTP/IMAP libraries.** Self-written over tokio (cumulatively ~700 lines vs adding 30k+ lines of deps). Supports the subset Thunderbird/Outlook need.
-- **YMP over QUIC.** Yggdrasil-ng provides only `PacketConn` (no QUIC streams). YMP adds reliability at ~300 lines instead of porting yggquic (~2000+ lines).
+- **QUIC mail overlay, not YMP.** YMP was chosen first because Yggdrasil-ng provides only
+  `PacketConn` (no QUIC streams) and reliability cost ~300 lines instead of porting yggquic.
+  It works, but only between 1.9 nodes: yggmail 1.8 (Go) speaks QUIC + SMTP-over-stream, so a
+  1.9 node was unreachable from the whole existing network. The overlay (`quic/`) runs quinn over
+  a `PacketConn`-backed `AsyncUdpSocket` and is what outbound mail uses. YMP is kept on the
+  inbound side only, for 1.9.0 nodes already deployed that speak nothing else, and is due to be removed.
 - **Ponytail throughout.** Marked with `ponytail:` comments. Examples: no chrono crate (stdlib timestamps), no thiserror in yggmail (manual `impl Display`), encryption stubbed (version byte 0x00), writer channel skipped (rusqlite mutex is enough).
 - **Schema compatible with yggmail_old** for migration path.
 - **localhost-only** for SMTP/IMAP — rejects non-loopback connections at accept time.
@@ -118,6 +126,7 @@ Key Yggdrasil-ng types used: `Core`, `Config`, `addr_for_key()`, `subnet_for_key
 
 Most of DESIGN.md Phases 1-7 are complete. Notable gaps:
 - At-rest encryption (XChaCha20-Poly1305): version byte plumbing exists, encryption not wired in (`chacha20poly1305` dep commented out in Cargo.toml)
-- IMAP IDLE: basic broadcast-based, but sender doesn't notify on delivery yet
+- IMAP IDLE: broadcast-based; every path that puts mail in INBOX notifies (receiver on network
+  delivery, sender on self-send)
 - YMP integration tests marked `#[ignore]` — need real Yggdrasil nodes or a proper duplex mock
 - Sent mailbox: outbound mail stays in Outbox after delivery (MOVE to Sent not implemented)

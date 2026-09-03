@@ -18,10 +18,7 @@ use quinn::{AsyncUdpSocket, UdpPoller};
 use tokio::sync::mpsc;
 
 use super::addr_table::AddrTable;
-
-/// Буфер входящего насоса. Совпадает с буфером насоса демукса, чтобы ни один
-/// слой не резал датаграммы.
-const RECV_BUF_BYTES: usize = 65535;
+use crate::core_conn::PUMP_BUF_BYTES;
 
 pub(crate) struct CoreUdpSocket {
     table: Arc<AddrTable>,
@@ -57,7 +54,9 @@ impl CoreUdpSocket {
         let recv_conn = conn;
         let recv_table = table.clone();
         tokio::spawn(async move {
-            let mut buf = vec![0u8; RECV_BUF_BYTES];
+            // Тот же буфер, что у насоса демукса, чтобы ни один слой не резал
+            // датаграммы: одна константа на двоих.
+            let mut buf = vec![0u8; PUMP_BUF_BYTES];
             loop {
                 // Симметрично исходящему насосу: без этого select входящий
                 // насос замечает уничтоженный сокет только по следующей

@@ -29,12 +29,18 @@ const READINESS_WAIT: Duration = Duration::from_secs(20);
 /// window where a peer accepted the mail but we were cancelled before
 /// de-queueing, producing a duplicate on restart; the receiver side already
 /// dedups via `mail_insert_inbox_dedup`.
+///
+/// `imap_notify` is the same IDLE wake channel the receiver uses. The sender
+/// needs it for one path only: self-send, which puts mail into INBOX without
+/// ever crossing the network, and so is the only inbound path a connected
+/// client would otherwise never be told about.
 pub fn spawn(
     storage: Arc<SqliteStorage>,
     quic: Arc<QuicMailTransport>,
     core: Arc<Core>,
     base_interval: Duration,
     mut stop: broadcast::Receiver<()>,
+    imap_notify: broadcast::Sender<()>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = base_interval;
@@ -45,7 +51,7 @@ pub fn spawn(
         loop {
             tokio::select! {
                 _ = stop.recv() => break,
-                result = process_queue(&storage, &quic, &core) => {
+                result = process_queue(&storage, &quic, &core, &imap_notify) => {
                     match result {
                         Ok(()) => {
                             // ponytail: success → back to base interval
@@ -74,6 +80,7 @@ async fn process_queue(
     storage: &SqliteStorage,
     quic: &QuicMailTransport,
     core: &Arc<Core>,
+    imap_notify: &broadcast::Sender<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let destinations = storage.queue_list_destinations()?;
     if destinations.is_empty() {
@@ -95,7 +102,7 @@ async fn process_queue(
 
         // Самому себе — локально, до readiness-gate.
         if dest_key == *core.public_key() {
-            deliver_to_self(storage, dest_hex, &dest_key)?;
+            deliver_to_self(storage, dest_hex, &dest_key, imap_notify)?;
             continue;
         }
 
@@ -208,6 +215,7 @@ fn deliver_to_self(
     storage: &SqliteStorage,
     dest_hex: &str,
     local_key: &[u8; 32],
+    imap_notify: &broadcast::Sender<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for qm in &storage.queue_get_for_destination(dest_hex)? {
         let Some(mail) = storage.mail_get("Outbox", qm.id)? else {
@@ -216,7 +224,12 @@ fn deliver_to_self(
         };
         // Тот же путь, что у приёмника: дедуп защищает от повторной укладки,
         // если снятие с очереди не доехало и опрос вернулся к тому же письму.
-        storage.mail_insert_inbox_dedup(local_key, &mail.mail)?;
+        if storage.mail_insert_inbox_dedup(local_key, &mail.mail)?.is_some() {
+            // Письмо реально появилось в INBOX — будим IDLE, как это делает
+            // приёмник для сетевой доставки. Ошибка send() штатна: подписчиков
+            // нет, пока не подключён почтовый клиент.
+            let _ = imap_notify.send(());
+        }
         storage.queue_delete(dest_hex, "Outbox", qm.id)?;
         if storage.queue_count_for_mail("Outbox", qm.id)? == 0 {
             let _ = storage.mail_move("Outbox", "Sent", qm.id);
@@ -258,7 +271,8 @@ mod tests {
             .queue_insert(&me_hex, "Outbox", id, &addr, &addr)
             .unwrap();
 
-        deliver_to_self(&storage, &me_hex, &me).expect("local delivery ok");
+        let (notify_tx, _) = broadcast::channel(16);
+        deliver_to_self(&storage, &me_hex, &me, &notify_tx).expect("local delivery ok");
 
         assert!(
             !storage.mail_list("INBOX").unwrap().is_empty(),
@@ -271,6 +285,36 @@ mod tests {
         assert!(
             !storage.mail_list("Sent").unwrap().is_empty(),
             "the last recipient moves the mail to Sent"
+        );
+    }
+
+    /// I3: self-send is an inbound path like any other — a client sitting in
+    /// IDLE must be woken. Without the notify the mail is in INBOX but the UI
+    /// stays empty until the client reconnects and re-polls.
+    #[test]
+    fn self_send_wakes_imap_idle() {
+        let storage = temp_db("self_send_idle");
+        let me = [0x43u8; 32];
+        let me_hex = hex::encode(me);
+        let addr = crate::address::create_address(&me);
+
+        let id = storage
+            .mail_insert("Outbox", b"Subject: note\r\n\r\nto myself\r\n")
+            .unwrap();
+        storage
+            .queue_insert(&me_hex, "Outbox", id, &addr, &addr)
+            .unwrap();
+
+        let (notify_tx, mut notify_rx) = broadcast::channel(16);
+        deliver_to_self(&storage, &me_hex, &me, &notify_tx).expect("local delivery ok");
+
+        assert!(
+            notify_rx.try_recv().is_ok(),
+            "self-send must wake IMAP IDLE clients"
+        );
+        assert!(
+            notify_rx.try_recv().is_err(),
+            "one mail, one wake — no spurious extra notifications"
         );
     }
 
@@ -299,7 +343,8 @@ mod tests {
         let core = test_core(0x53);
 
         let (stop_tx, stop_rx) = broadcast::channel(1);
-        let handle = spawn(storage, quic, core, Duration::from_secs(30), stop_rx);
+        let (notify_tx, _) = broadcast::channel(16);
+        let handle = spawn(storage, quic, core, Duration::from_secs(30), stop_rx, notify_tx);
 
         // Past the 2s startup delay, with an empty queue process_queue()
         // returns at once, so by now the loop is parked in sleep(30s)/notify.
@@ -336,7 +381,8 @@ mod tests {
             .unwrap();
 
         let (stop_tx, stop_rx) = broadcast::channel(1);
-        let handle = spawn(storage, quic, core, Duration::from_secs(30), stop_rx);
+        let (notify_tx, _) = broadcast::channel(16);
+        let handle = spawn(storage, quic, core, Duration::from_secs(30), stop_rx, notify_tx);
 
         // Past the 2s startup delay and into wait_for_up_peer's up-to-20s wait
         // (no peer will ever come up in this test).

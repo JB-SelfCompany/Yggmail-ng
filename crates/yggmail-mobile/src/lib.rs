@@ -18,6 +18,7 @@ use yggdrasil::core::Core;
 use yggmail::address::create_address;
 use yggmail::core_conn::CoreConn;
 use yggmail::identity::{load_or_migrate_identity, parse_signing_key};
+use yggmail::peer::receiver::{Stored, store};
 use yggmail::quic::QuicMailTransport;
 use yggmail::storage::SqliteStorage;
 use yggmail::ymp::YmpSession;
@@ -234,27 +235,22 @@ impl YggmailMobile {
                                     // open: it sees 250 only once `ack` is sent, and
                                     // 451 (retry later) if it never is. Acknowledge
                                     // strictly after the insert returned.
-                                    let durable = match rx_storage.mail_insert_inbox_dedup(&from_key, &data) {
-                                        Ok(Some(id)) => {
-                                            tracing::info!("mobile: stored in INBOX id={}", id);
+                                    //
+                                    // The insert itself lives in yggmail::peer::receiver::store
+                                    // — this loop exists only because Android drives its own
+                                    // recv loop instead of receiver::spawn, and the two must
+                                    // not be able to decide durability differently.
+                                    let durable = match store(&rx_storage, from_key, &data) {
+                                        Stored::New(_) => {
                                             // Notify IMAP IDLE clients (Delta Chat)
                                             let _ = rx_imap_notify.send(());
                                             true
                                         }
-                                        Ok(None) => {
-                                            tracing::debug!(
-                                                "mobile: duplicate mail from {} dropped",
-                                                hex::encode(from_key)
-                                            );
-                                            // No IDLE notify — duplicate was not stored.
-                                            // Still durable: it is in INBOX from the
-                                            // earlier delivery, so the peer is done.
-                                            true
-                                        }
-                                        Err(e) => {
-                                            tracing::error!("mail_insert error: {e}");
-                                            false
-                                        }
+                                        // No IDLE notify — the duplicate was not stored.
+                                        // Still durable: it is in INBOX from the earlier
+                                        // delivery, so the peer is done.
+                                        Stored::Duplicate => true,
+                                        Stored::Failed => false,
                                     };
                                     if durable {
                                         if let Some(ack) = ack {
@@ -278,7 +274,14 @@ impl YggmailMobile {
             let tx_storage = storage.clone();
             let tx_quic = quic.clone();
             let tx_stop = stop_tx.subscribe();
-            yggmail::peer::sender::spawn(tx_storage, tx_quic, core.clone(), Duration::from_secs(30), tx_stop);
+            yggmail::peer::sender::spawn(
+                tx_storage,
+                tx_quic,
+                core.clone(),
+                Duration::from_secs(30),
+                tx_stop,
+                imap_notify_tx.clone(),
+            );
 
             // Path-warmer: keep the Yggdrasil path to recently-active correspondents
             // warm. ironwood expires a cached path after ~60s (path_timeout); the Go

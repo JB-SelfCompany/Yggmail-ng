@@ -312,22 +312,23 @@ impl QuicMailTransport {
     }
 
     /// Пиры, активные за последние `within` — для прогревателя путей.
+    ///
+    /// Устаревшие записи выселяются, а не просто отфильтровываются: иначе карта
+    /// растёт весь аптайм узла, храня каждого пира, с которым когда-либо был
+    /// обмен. Так же устроен `YmpSession::recent_peers`.
     pub async fn recent_peers(&self, within: Duration) -> Vec<[u8; 32]> {
         let now = Instant::now();
-        self.active_peers
-            .lock()
-            .await
-            .iter()
-            .filter(|(_, seen)| now.duration_since(**seen) <= within)
-            .map(|(k, _)| *k)
-            .collect()
+        let mut map = self.active_peers.lock().await;
+        map.retain(|_, seen| now.duration_since(*seen) <= within);
+        map.keys().copied().collect()
     }
 
     /// Сколько соединений сейчас в кэше (для тестов).
     ///
     /// `try_lock`, а не `blocking_lock`: последний паникует при вызове изнутри
     /// рантайма tokio, а вызывают его как раз из `#[tokio::test]`.
-    pub fn cached_connection_count(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn cached_connection_count(&self) -> usize {
         self.conns.try_lock().map(|g| g.len()).unwrap_or(0)
     }
 
@@ -558,6 +559,29 @@ mod tests {
 
         let recent = alice.recent_peers(std::time::Duration::from_secs(60)).await;
         assert!(recent.contains(&pub_b), "peer must be tracked as recently active");
+    }
+
+    /// Устаревшая запись должна уходить из `active_peers`, а не просто
+    /// выпадать из выдачи. Выдача этого не показывает — показывает второй
+    /// вызов с широким окном: если запись всё ещё в карте, она там всплывёт.
+    #[tokio::test]
+    async fn recent_peers_evicts_stale_entries() {
+        let key_a = SigningKey::from_bytes(&[17u8; 32]);
+        let key_b = SigningKey::from_bytes(&[18u8; 32]);
+        let (conn_a, _conn_b) = MemPacketConn::pair(key_a.clone(), key_b);
+        let alice = QuicMailTransport::new(conn_a as Arc<dyn PacketConn>, &key_a).unwrap();
+
+        alice.note_active([0xABu8; 32]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert!(
+            alice.recent_peers(std::time::Duration::from_millis(1)).await.is_empty(),
+            "a peer last seen 20ms ago is outside a 1ms window"
+        );
+        assert!(
+            alice.recent_peers(std::time::Duration::from_secs(60)).await.is_empty(),
+            "the stale entry must have been evicted from active_peers, not merely filtered out of the previous result"
+        );
     }
 
     /// Дозвон до пира, который никогда не отвечает ни на один пакет
