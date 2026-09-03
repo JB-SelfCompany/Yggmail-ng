@@ -7,6 +7,7 @@
 use crate::address::parse_address;
 use crate::storage::SqliteStorage;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpListener;
@@ -151,6 +152,40 @@ impl Session {
             }
         };
 
+        // Каждый получатель обязан попасть в очередь. Раньше неразобранный
+        // адрес молча выбрасывался, письмо оставалось в Outbox, клиент получал
+        // 250 OK, а лог считал self.rcpts.len() и рапортовал успех — письмо
+        // исчезало без единой строки в логе (sender видит пустой список
+        // назначений и выходит молча). Go на этом месте валит DATA целиком
+        // (`smtpsender/sender.go`, QueueFor возвращает ошибку), и это
+        // правильное поведение: клиент должен узнать, что письмо не уйдёт.
+        //
+        // Parsed and deduped BEFORE mail_insert: parsing only needs
+        // self.rcpts, never the mail's id, so an unparseable recipient is
+        // caught while there is nothing in Outbox yet to roll back. Dedup by
+        // dest_hex because address.rs accepts both @yggmail and its FQDN
+        // alias @yggmail.local for the same key — two RCPT TO for one key
+        // would otherwise collide on queue's PRIMARY KEY (destination,
+        // mailbox, id).
+        let mut seen = HashSet::with_capacity(self.rcpts.len());
+        let mut recipients = Vec::with_capacity(self.rcpts.len());
+        for rcpt in &self.rcpts {
+            let Some(dest_key) = parse_address(rcpt) else {
+                tracing::error!("SMTP: rejecting mail — unparseable recipient {rcpt}");
+                let _ = writer
+                    .write_all(b"550 Invalid recipient address\r\n")
+                    .await;
+                self.from = None;
+                self.rcpts.clear();
+                self.state = State::ExpectMail;
+                return;
+            };
+            let dest_hex = hex::encode(dest_key);
+            if seen.insert(dest_hex.clone()) {
+                recipients.push((dest_hex, rcpt.clone()));
+            }
+        }
+
         // Add Received header (RFC 2822). Delta Chat provides its own Date header.
         let received = format!(
             "Received: from localhost by Yggmail {}; {}\r\n",
@@ -168,48 +203,31 @@ impl Session {
             }
         };
 
-        // Каждый получатель обязан попасть в очередь. Раньше неразобранный
-        // адрес молча выбрасывался, письмо оставалось в Outbox, клиент получал
-        // 250 OK, а лог считал self.rcpts.len() и рапортовал успех — письмо
-        // исчезало без единой строки в логе (sender видит пустой список
-        // назначений и выходит молча). Go на этом месте валит DATA целиком
-        // (`smtpsender/sender.go`, QueueFor возвращает ошибку), и это
-        // правильное поведение: клиент должен узнать, что письмо не уйдёт.
-        let mut queued = 0usize;
-        for rcpt in &self.rcpts {
-            let Some(dest_key) = parse_address(rcpt) else {
-                tracing::error!("SMTP: rejecting mail — unparseable recipient {rcpt}");
-                let _ = writer
-                    .write_all(b"550 Invalid recipient address\r\n")
-                    .await;
+        for (dest_hex, rcpt) in &recipients {
+            if let Err(e) = self
+                .storage
+                .queue_insert(dest_hex, "Outbox", id, &from, rcpt)
+            {
+                tracing::error!("SMTP: failed to enqueue for {}: {}", rcpt, e);
+                let _ = writer.write_all(b"451 Queue error\r\n").await;
                 // mail_delete только выставляет deleted=1 (семантика IMAP),
-                // строку physически убирает expunge. Без него в Outbox остался
-                // бы осиротевший «удалённый» экземпляр отвергнутого письма.
+                // строку физически убирает expunge. ON DELETE CASCADE на
+                // queue (queue.rs:15-16) заодно убирает строки очереди,
+                // поставленные более ранними получателями в этом цикле.
                 let _ = self.storage.mail_delete("Outbox", id);
                 let _ = self.storage.mail_expunge("Outbox");
                 self.from = None;
                 self.rcpts.clear();
                 self.state = State::ExpectMail;
                 return;
-            };
-            let dest_hex = hex::encode(dest_key);
-            if let Err(e) = self
-                .storage
-                .queue_insert(&dest_hex, "Outbox", id, &from, rcpt)
-            {
-                tracing::error!("SMTP: failed to enqueue for {}: {}", rcpt, e);
-                let _ = writer.write_all(b"451 Queue error\r\n").await;
-                self.from = None;
-                self.rcpts.clear();
-                self.state = State::ExpectMail;
-                return;
             }
-            queued += 1;
         }
 
         let _ = writer.write_all(b"250 OK\r\n").await;
-        // Считаем реально поставленное в очередь, а не число команд RCPT TO.
-        tracing::info!("SMTP: queued mail from {from} to {queued} recipients");
+        tracing::info!(
+            "SMTP: queued mail from {from} to {} recipients",
+            recipients.len()
+        );
 
         self.from = None;
         self.rcpts.clear();
@@ -501,9 +519,17 @@ pub async fn handle_conn(
 mod tests {
     use super::*;
     use crate::storage::SqliteStorage;
+    use rusqlite::Connection;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn temp_db(name: &str) -> SqliteStorage {
+        let (_path, storage) = temp_db_with_path(name);
+        storage
+    }
+
+    /// Same as `temp_db`, but also hands back the file path — needed by tests
+    /// that must open a second raw connection to the same database.
+    fn temp_db_with_path(name: &str) -> (std::path::PathBuf, SqliteStorage) {
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
             "yggmail_smtp_test_{}_{}.db",
@@ -511,7 +537,8 @@ mod tests {
             name
         ));
         let _ = std::fs::remove_file(&path);
-        SqliteStorage::open(&path.to_string_lossy(), None).unwrap()
+        let storage = SqliteStorage::open(&path.to_string_lossy(), None).unwrap();
+        (path, storage)
     }
 
     /// Smoke test: connect to SMTP, send HELO/MAIL/RCPT/DATA/QUIT, verify mail lands in Outbox.
@@ -655,6 +682,181 @@ mod tests {
         // that a later run could mistake for deliverable mail.
         let dests = storage.queue_list_destinations().unwrap();
         assert!(dests.is_empty(), "nothing should be queued, got {dests:?}");
+        let ids = storage.mail_list("Outbox").unwrap();
+        assert!(ids.is_empty(), "Outbox should hold no orphan, got {ids:?}");
+    }
+
+    /// Task 16 (I2, dedup half): `k@yggmail` and `k@yggmail.local` parse to
+    /// the same key (address.rs domain alias). Two RCPT TO for the same
+    /// recipient in different domains must collapse to one queue row and a
+    /// single 250, not a PRIMARY KEY collision on the queue table.
+    #[tokio::test]
+    async fn duplicate_recipient_across_domain_alias_queues_once() {
+        let storage = Arc::new(temp_db("dedup_alias"));
+        let local_key = [0x42u8; 32];
+        let bob_key = [0x99u8; 32];
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv_storage = storage.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_conn(stream, srv_storage, local_key, None).await;
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 1024];
+
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"220 "));
+
+        stream.write_all(b"HELO test\r\n").await.unwrap();
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"250 "));
+
+        let from = crate::address::create_address(&local_key);
+        stream
+            .write_all(format!("MAIL FROM:<{}>\r\n", from).as_bytes())
+            .await
+            .unwrap();
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"250 "));
+
+        let bob_hex = hex::encode(bob_key);
+        stream
+            .write_all(format!("RCPT TO:<{}@yggmail>\r\n", bob_hex).as_bytes())
+            .await
+            .unwrap();
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"250 "));
+
+        stream
+            .write_all(format!("RCPT TO:<{}@yggmail.local>\r\n", bob_hex).as_bytes())
+            .await
+            .unwrap();
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"250 "));
+
+        stream.write_all(b"DATA\r\n").await.unwrap();
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"354 "));
+
+        stream
+            .write_all(b"Subject: Test\r\n\r\nbody\r\n.\r\n")
+            .await
+            .unwrap();
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(
+            buf[..n].starts_with(b"250 "),
+            "expected single 250 OK, got {:?}",
+            String::from_utf8_lossy(&buf[..n])
+        );
+
+        let dests = storage.queue_list_destinations().unwrap();
+        assert_eq!(dests, vec![bob_hex.clone()], "expected exactly one destination");
+        let queued = storage.queue_get_for_destination(&bob_hex).unwrap();
+        assert_eq!(queued.len(), 1, "expected exactly one queue row, got {queued:?}");
+    }
+
+    /// Task 16 (I2, rollback half): a genuine `queue_insert` failure for one
+    /// recipient must roll back the whole mail — including queue rows already
+    /// inserted for earlier recipients in the same DATA — and answer 451, not
+    /// leave a partially-queued mail the client believes failed.
+    ///
+    /// The collision is forced deterministically: `Outbox` is a fresh
+    /// mailbox, so its `uid_next` counter (storage/mod.rs) starts at 1 and
+    /// the mail this test sends is the first ever inserted into it, so it is
+    /// guaranteed to land on id 1. A queue row for (eve_hex, "Outbox", 1) is
+    /// pre-seeded via a raw connection (FK checks off, since the mails row it
+    /// would reference doesn't exist yet) so the real queue_insert for that
+    /// same destination+mailbox+id hits queue's PRIMARY KEY.
+    #[tokio::test]
+    async fn failed_queue_insert_rolls_back_earlier_recipients_and_mail() {
+        let (path, storage) = temp_db_with_path("rollback");
+        let storage = Arc::new(storage);
+        let local_key = [0x42u8; 32];
+        let charlie_key = [0x11u8; 32];
+        let eve_key = [0x99u8; 32];
+        let eve_hex = hex::encode(eve_key);
+
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+            raw.execute(
+                "INSERT INTO queue (destination, mailbox, id, mail, rcpt) VALUES (?1, 'Outbox', 1, 'seed', 'seed')",
+                [&eve_hex],
+            )
+            .unwrap();
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv_storage = storage.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_conn(stream, srv_storage, local_key, None).await;
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 1024];
+
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"220 "));
+
+        stream.write_all(b"HELO test\r\n").await.unwrap();
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"250 "));
+
+        let from = crate::address::create_address(&local_key);
+        stream
+            .write_all(format!("MAIL FROM:<{}>\r\n", from).as_bytes())
+            .await
+            .unwrap();
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"250 "));
+
+        // Charlie is a distinct, unproblematic recipient queued first; the
+        // rollback must undo his row too, not just skip Eve.
+        let charlie = crate::address::create_address(&charlie_key);
+        stream
+            .write_all(format!("RCPT TO:<{}>\r\n", charlie).as_bytes())
+            .await
+            .unwrap();
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"250 "));
+
+        let eve = crate::address::create_address(&eve_key);
+        stream
+            .write_all(format!("RCPT TO:<{}>\r\n", eve).as_bytes())
+            .await
+            .unwrap();
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"250 "));
+
+        stream.write_all(b"DATA\r\n").await.unwrap();
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"354 "));
+
+        stream
+            .write_all(b"Subject: Test\r\n\r\nbody\r\n.\r\n")
+            .await
+            .unwrap();
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(
+            buf[..n].starts_with(b"451 "),
+            "expected 451 on genuine queue failure, got {:?}",
+            String::from_utf8_lossy(&buf[..n])
+        );
+
+        let dests = storage.queue_list_destinations().unwrap();
+        assert!(
+            dests.is_empty(),
+            "no queue rows may survive a rolled-back mail, got {dests:?}"
+        );
         let ids = storage.mail_list("Outbox").unwrap();
         assert!(ids.is_empty(), "Outbox should hold no orphan, got {ids:?}");
     }
