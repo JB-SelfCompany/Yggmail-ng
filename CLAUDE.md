@@ -76,7 +76,7 @@ Wire format: `type(1) | msg_id(8 BE) | seq(2 BE) | total(2 BE) | payload_len(2 B
 ### Storage schema
 
 Tables: `mails`, `mailboxes`, `queue`, `config`. Key details:
-- Mail BLOBs stored as raw RFC 5322 with `version byte` prefix (0x00 = plaintext, 0x01 = XChaCha20 encrypted — encryption stub currently)
+- Mail BLOBs stored as raw RFC 5322 with `version byte` prefix (0x00 = plaintext, 0x01 = XChaCha20-Poly1305 encrypted under the wrapped data key; live, see `storage/mod.rs`)
 - `queue.destination` = hex pubkey (not full address)
 - Protected mailboxes: INBOX, Outbox, Sent (can't delete/rename)
 - `Arc<Mutex<Connection>>` — no writer channel, rusqlite serializes internally
@@ -90,7 +90,7 @@ Tables: `mails`, `mailboxes`, `queue`, `config`. Key details:
   1.9 node was unreachable from the whole existing network. The overlay (`quic/`) runs quinn over
   a `PacketConn`-backed `AsyncUdpSocket` and is what outbound mail uses. YMP is kept on the
   inbound side only, for 1.9.0 nodes already deployed that speak nothing else, and is due to be removed.
-- **Ponytail throughout.** Marked with `ponytail:` comments. Examples: no chrono crate (stdlib timestamps), no thiserror in yggmail (manual `impl Display`), encryption stubbed (version byte 0x00), writer channel skipped (rusqlite mutex is enough).
+- **Ponytail throughout.** Marked with `ponytail:` comments. Examples: no chrono crate (stdlib timestamps), no thiserror in yggmail (manual `impl Display`), writer channel skipped (rusqlite mutex is enough).
 - **Schema compatible with yggmail_old** for migration path.
 - **localhost-only** for SMTP/IMAP — rejects non-loopback connections at accept time.
 - **rustls форкнут** (`../rustls-yggmail`, подключён через `[patch.crates-io]` в
@@ -125,8 +125,18 @@ Key Yggdrasil-ng types used: `Core`, `Config`, `addr_for_key()`, `subnet_for_key
 ## Current status (Phase implementation)
 
 Most of DESIGN.md Phases 1-7 are complete. Notable gaps:
-- At-rest encryption (XChaCha20-Poly1305): version byte plumbing exists, encryption not wired in (`chacha20poly1305` dep commented out in Cargo.toml)
-- IMAP IDLE: broadcast-based; every path that puts mail in INBOX notifies (receiver on network
-  delivery, sender on self-send)
+- IMAP IDLE: broadcast-based; every *delivery* path notifies (receiver on network delivery,
+  sender on self-send). IMAP COPY/APPEND and the welcome mail (`main.rs:106`) write to INBOX
+  without notifying.
 - YMP integration tests marked `#[ignore]` — need real Yggdrasil nodes or a proper duplex mock
-- Sent mailbox: outbound mail stays in Outbox after delivery (MOVE to Sent not implemented)
+
+Accepted limitations (merged with deliberately, not defects):
+- **Outbound delivery is serial per poll cycle.** `peer/sender.rs` walks destinations and mails
+  one at a time. One unreachable or slow destination blocks mail to every other destination for
+  the duration of its budget — up to ~20 minutes for a 33 MB mail. A per-destination task split
+  is filed as follow-up.
+- **Outbound to already-deployed 1.9.0 nodes is impossible.** Inbound accepts both YMP and QUIC;
+  outbound is QUIC-only. A 1.9.0 node has no QUIC listener, so the dial fails, the queue row
+  stays forever — there is no queue expiry and no bounce, and the local SMTP server already
+  answered `250`. Trade-off taken knowingly: the 1.9.0 population is small and already
+  non-interoperable with everything else.
