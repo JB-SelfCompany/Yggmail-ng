@@ -199,6 +199,11 @@ impl Session {
             Err(e) => {
                 tracing::error!("SMTP: failed to store mail in Outbox: {e}");
                 let _ = writer.write_all(b"451 Storage error\r\n").await;
+                // Симметрично трём остальным выходам: транзакция закончена,
+                // сессия обязана вернуться к ожиданию нового MAIL FROM.
+                self.from = None;
+                self.rcpts.clear();
+                self.state = State::ExpectMail;
                 return;
             }
         };
@@ -214,8 +219,20 @@ impl Session {
                 // строку физически убирает expunge. ON DELETE CASCADE на
                 // queue (queue.rs:15-16) заодно убирает строки очереди,
                 // поставленные более ранними получателями в этом цикле.
-                let _ = self.storage.mail_delete("Outbox", id);
-                let _ = self.storage.mail_expunge("Outbox");
+                // Ошибки отката логируются, а не глотаются: сам по себе
+                // проверенный Result ничего не чинит (все три вызова идут по
+                // одному Arc<Mutex<Connection>>, и по-настоящему больная база
+                // завалит и mail_delete), но застрявший откат оставляет письмо
+                // в Outbox с deleted=0 — и sender его всё-таки отправит. Без
+                // строки в логе это неотличимо от «клиент повторил сам».
+                // Настоящее лекарство — одна транзакция на mail_insert плюс все
+                // queue_insert; заведено отдельной задачей.
+                if let Err(e) = self.storage.mail_delete("Outbox", id) {
+                    tracing::error!("SMTP: rollback of mail #{id} failed: {e}");
+                }
+                if let Err(e) = self.storage.mail_expunge("Outbox") {
+                    tracing::error!("SMTP: expunge after rollback of mail #{id} failed: {e}");
+                }
                 self.from = None;
                 self.rcpts.clear();
                 self.state = State::ExpectMail;

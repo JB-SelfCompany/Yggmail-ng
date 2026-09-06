@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 
 /// Потолок письма — тот же, что у локального SMTP (`smtp/mod.rs:23`).
 /// Стриминг и файловое хранилище из продукта убраны, поэтому лимит один.
-const MAX_DATA_BYTES: usize = 33 * 1024 * 1024;
+pub(super) const MAX_DATA_BYTES: usize = 33 * 1024 * 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 /// Потолок строк-продолжений `250-...` в ответе. 1.8 никогда не шлёт больше
 /// нескольких (SIZE/8BITMIME на EHLO) — 32 с большим запасом отличает

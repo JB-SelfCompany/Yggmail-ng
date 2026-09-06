@@ -15,7 +15,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
 use super::smtp_overlay::{
-    OverlayError, overlay_send_stream, overlay_serve_stream, write_data_reply,
+    MAX_DATA_BYTES, OverlayError, overlay_send_stream, overlay_serve_stream, write_data_reply,
 };
 use super::{QuicOverlay, peer_key};
 use crate::address::create_address;
@@ -86,9 +86,25 @@ pub type InboundMail = ([u8; 32], Vec<u8>, Option<DurabilityAck>);
 /// Сложение насыщающее — не ради переполнения (`MAX_DATA_BYTES` уже держит
 /// `message.len()` в разумных пределах), а чтобы не тащить сюда лишнюю
 /// проверку ради одной операции.
-fn dialog_budget(message_len: usize) -> Duration {
+const fn dialog_budget(message_len: usize) -> Duration {
     DIALOG_TIMEOUT.saturating_add(Duration::from_secs(message_len as u64 / MIN_THROUGHPUT))
 }
+
+/// Бюджет входящего диалога — от kick-байта до конца DATA.
+///
+/// Асимметрия с отправкой: там размер письма известен заранее, здесь он
+/// выясняется только по завершении DATA, то есть ровно тогда, когда бюджет уже
+/// не нужен. Поэтому кормим `dialog_budget` тем максимумом, который приёмная
+/// сторона вообще готова принять, — `MAX_DATA_BYTES`. Плоский `DIALOG_TIMEOUT`
+/// был бы неверен: он убивал бы законное 33-МиБ письмо ровно на той скорости,
+/// которую отправляющая сторона намеренно разрешает через `MIN_THROUGHPUT`, —
+/// и такое письмо не доставилось бы никогда, сколько ни повторяй. Смысл этого
+/// бюджета не в точности, а в том, чтобы неограниченное удержание стало
+/// ограниченным: молчащий пир держит задачу и стрим ~20 минут вместо вечности.
+/// Вместе с `DURABILITY_TIMEOUT`, который отсчитывается уже после него, всё
+/// удержание остаётся ниже 30-минутного `max_idle_timeout` — инвариант закреплён
+/// тестом `dialog_budget_grows_with_message_size_but_stays_under_idle_timeout`.
+const INBOUND_DIALOG_TIMEOUT: Duration = dialog_budget(MAX_DATA_BYTES);
 
 #[derive(Debug)]
 pub enum QuicMailError {
@@ -418,7 +434,30 @@ async fn serve_one_stream(
         .map_err(|e| QuicMailError::Transport(format!("kick byte: {e}")))?;
     tracing::info!("quic: stream open, kick consumed from {}", hex::encode(&peer[..8]));
 
-    let (from, mail) = overlay_serve_stream(recv, &mut send, local_key, peer).await?;
+    // До этого места весь входящий диалог был без бюджета вовсе: пир мог
+    // прислать kick-байт и замолчать, а keep-alive не давал сработать
+    // idle-таймауту соединения — задача, стрим и BufReader висели вечно, и
+    // таких можно было навесить сколько угодно.
+    let served = match tokio::time::timeout(
+        INBOUND_DIALOG_TIMEOUT,
+        overlay_serve_stream(recv, &mut send, local_key, peer),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::warn!(
+                "quic: inbound dialog from {} timed out after {:?}, resetting stream",
+                hex::encode(&peer[..8]),
+                INBOUND_DIALOG_TIMEOUT
+            );
+            // Сбрасываем только стрим, не соединение: у того же пира могут идти
+            // другие, живые диалоги. Пир увидит ошибку стрима, а не тишину.
+            let _ = send.reset(1u32.into());
+            return Err(QuicMailError::Transport("inbound dialog timeout".into()));
+        }
+    };
+    let (from, mail) = served?;
     tracing::info!("smtp-overlay: DATA {} bytes from {}", mail.len(), hex::encode(&peer[..8]));
 
     // Общий бюджет на «отдать и дождаться»: очередь может быть забита ровно
@@ -716,6 +755,82 @@ mod tests {
         );
     }
 
+    /// Провалившийся по таймауту диалог обязан выбросить соединение из кэша.
+    /// Иначе следующая отправка тому же пиру достанет из кэша тот же труп
+    /// (`open_bi` на нём не ошибается сам по себе) и снова простоит полный
+    /// бюджет — и так каждый цикл опроса.
+    #[tokio::test(start_paused = true)]
+    async fn dialog_timeout_evicts_the_connection_from_the_cache() {
+        let key_a = SigningKey::from_bytes(&[57u8; 32]);
+        let key_b = SigningKey::from_bytes(&[58u8; 32]);
+        let pub_b = key_b.verifying_key().to_bytes();
+
+        let (conn_a, conn_b) = MemPacketConn::pair(key_a.clone(), key_b.clone());
+        let alice = QuicMailTransport::new(conn_a as Arc<dyn PacketConn>, &key_a).unwrap();
+
+        // Молчаливый сервер: хендшейк проходит (значит соединение попадает в
+        // кэш), дальше — ни accept_bi, ни байта в ответ.
+        let server = QuicOverlay::new(conn_b as Arc<dyn PacketConn>, &key_b).unwrap();
+        tokio::spawn(async move {
+            let _incoming = server.accept().await;
+            std::future::pending::<()>().await
+        });
+
+        let result = alice.send(pub_b, b"Subject: x\r\n\r\nbody\r\n".to_vec()).await;
+        assert!(result.is_err(), "send against a silent peer must fail on the dialog budget");
+        assert_eq!(
+            alice.cached_connection_count(),
+            0,
+            "a dialog timeout must evict the dead connection from the cache"
+        );
+    }
+
+    /// Входящий диалог тоже обязан иметь бюджет. Пир открывает стрим, шлёт
+    /// kick-байт и замолкает навсегда: keep-alive держит соединение живым, так
+    /// что без таймаута приёмная сторона удерживала бы задачу, стрим и
+    /// BufReader вечно — и таких можно навесить сколько угодно.
+    #[tokio::test(start_paused = true)]
+    async fn inbound_dialog_with_a_silent_peer_is_torn_down_within_its_budget() {
+        let key_a = SigningKey::from_bytes(&[55u8; 32]);
+        let key_b = SigningKey::from_bytes(&[56u8; 32]);
+        let pub_b = key_b.verifying_key().to_bytes();
+
+        let (conn_a, conn_b) = MemPacketConn::pair(key_a.clone(), key_b.clone());
+        // Клиент — сырой QuicOverlay, чтобы после kick-байта не сказать больше
+        // ни слова; сервер — настоящий транспорт с его приёмным циклом.
+        let client = QuicOverlay::new(conn_a as Arc<dyn PacketConn>, &key_a).unwrap();
+        let _server = QuicMailTransport::new(conn_b as Arc<dyn PacketConn>, &key_b).unwrap();
+
+        let connection = client.connect(pub_b).await.expect("dial ok");
+        let (mut send, mut recv) = connection.open_bi().await.expect("open_bi ok");
+        send.write_all(&[0u8]).await.expect("kick byte");
+        send.flush().await.expect("kick flush");
+
+        // `read_to_end`, а не одно чтение: сервер сразу шлёт приветствие `220`,
+        // так что первое же чтение удалось бы и на неисправленном коде. Здесь
+        // же нас интересует конец стрима — а он наступает только когда сервер
+        // сдался и сбросил его.
+        let start = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            INBOUND_DIALOG_TIMEOUT + Duration::from_secs(120),
+            recv.read_to_end(64 * 1024),
+        )
+        .await
+        .expect("server must give up on a silent inbound dialog, not hold the stream forever");
+        let elapsed = start.elapsed();
+
+        assert!(
+            outcome.is_err(),
+            "the server must reset the stream, not leave a dialog that never happened open"
+        );
+        // Нижняя граница: провал обязан случиться на бюджете диалога, а не
+        // раньше по какой-то посторонней причине.
+        assert!(
+            elapsed >= INBOUND_DIALOG_TIMEOUT,
+            "must not give up before the inbound budget, took {elapsed:?}"
+        );
+    }
+
     /// Бюджет диалога растёт линейно с размером письма при `MIN_THROUGHPUT`,
     /// но остаётся ниже 30-минутного `max_idle_timeout` даже для `MAX_DATA_BYTES`
     /// — иначе транспорт убил бы соединение раньше, чем сработал бы сам бюджет.
@@ -742,6 +857,18 @@ mod tests {
         assert!(
             DURABILITY_TIMEOUT < DIALOG_TIMEOUT,
             "the durability wait must fit inside the dialog budget, got {DURABILITY_TIMEOUT:?} vs {DIALOG_TIMEOUT:?}"
+        );
+        // Входящая сторона: бюджет диалога и следующее за ним ожидание
+        // подтверждения складываются — вся эта сумма обязана поместиться под
+        // 30-минутный max_idle_timeout, иначе транспорт убьёт соединение
+        // раньше, чем сработает наш собственный таймаут, и `451` не уедет.
+        assert!(
+            DURABILITY_TIMEOUT < INBOUND_DIALOG_TIMEOUT,
+            "the durability wait must fit inside the inbound dialog budget too"
+        );
+        assert!(
+            INBOUND_DIALOG_TIMEOUT + DURABILITY_TIMEOUT < Duration::from_secs(1800),
+            "the whole inbound hold must stay under the QUIC idle timeout, got {INBOUND_DIALOG_TIMEOUT:?}"
         );
     }
 

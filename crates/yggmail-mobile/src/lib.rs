@@ -341,6 +341,16 @@ impl YggmailMobile {
                 h.abort();
             }
             let _ = node.stop_tx.send(());
+            // Release the mesh, exactly as the binary does at main.rs:193.
+            // Aborting the tasks above is not enough: the demux pump and the
+            // QUIC endpoint's recv pump are parked in `read_from`, which only
+            // errors once the Core is closed. A stopped node receives no
+            // traffic, so without this they park forever holding Arc<Core> —
+            // and Android starts/stops this service routinely, stacking a
+            // second Core on top of the first each time.
+            if let Err(e) = self.runtime.block_on(node.core.close()) {
+                tracing::warn!("mobile: core close failed: {e:?}");
+            }
         }
         *guard = None;
     }

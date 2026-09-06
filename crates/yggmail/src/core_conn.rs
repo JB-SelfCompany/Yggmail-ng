@@ -68,6 +68,10 @@ impl PacketConn for CoreConn {
 /// QUIC Fixed Bit (RFC 9000 §17.2/§17.3). Взведён в каждом валидном QUIC-пакете:
 /// long header 0xC0–0xFF, short header 0x40–0x7F. Типы YMP (0x10 DATA, 0x11 ACK,
 /// 0x12 SYN, 0x13 SYN-ACK) его не имеют, поэтому множества не пересекаются.
+/// Единственное исключение — Version Negotiation: там бит произвольный
+/// (RFC 9000 §17.2.1), так что VN со сброшенным битом уйдёт в YMP-ветку и будет
+/// отброшен. Обе стороны сегодня говорят на QUIC v1, поэтому последствие одно:
+/// несовпадение версий проявится таймаутом дозвона, а не внятной ошибкой.
 const QUIC_FIXED_BIT: u8 = 0x40;
 
 /// Наибольшая датаграмма, которую переносит mesh. Насосы читают в буфер этого
@@ -115,23 +119,45 @@ pub fn demux(
             if !ymp_alive && !quic_alive {
                 break;
             }
-            match pump.read_from(&mut buf).await {
-                Ok((0, _)) => continue,
-                Ok((n, from)) => {
-                    if buf[0] & QUIC_FIXED_BIT != 0 {
-                        if quic_alive && quic_tx.send((buf[..n].to_vec(), from)).is_err() {
-                            tracing::debug!("demux: quic consumer gone");
-                            quic_alive = false;
+            // Тот же аварийный выход, что у входящего насоса в
+            // `quic::udp_adapter` (:67): без него насос узнаёт об уходе
+            // потребителя только по следующей датаграмме — а их две, по одной
+            // на маршрут, и на остановленном узле они уже не придут никогда.
+            // Ветки `closed()` отключаются вместе со своим маршрутом, иначе
+            // уже сработавшая `closed()` крутила бы select вхолостую.
+            //
+            // Гонка `read_from` здесь безопасна: между приёмом датаграммы и
+            // возвратом из `Core::read_from` нет ни одной точки await
+            // (yggdrasil/core.rs:168-173), а ожидание внутри — это `recv()` на
+            // mpsc, отменяемый без потери сообщения. Отменённый poll не может
+            // проглотить датаграмму, он лишь не начнёт её читать.
+            tokio::select! {
+                _ = ymp_tx.closed(), if ymp_alive => {
+                    tracing::debug!("demux: ymp consumer gone");
+                    ymp_alive = false;
+                }
+                _ = quic_tx.closed(), if quic_alive => {
+                    tracing::debug!("demux: quic consumer gone");
+                    quic_alive = false;
+                }
+                r = pump.read_from(&mut buf) => match r {
+                    Ok((0, _)) => continue,
+                    Ok((n, from)) => {
+                        if buf[0] & QUIC_FIXED_BIT != 0 {
+                            if quic_alive && quic_tx.send((buf[..n].to_vec(), from)).is_err() {
+                                tracing::debug!("demux: quic consumer gone");
+                                quic_alive = false;
+                            }
+                        } else if ymp_alive && ymp_tx.send((buf[..n].to_vec(), from)).is_err() {
+                            tracing::debug!("demux: ymp consumer gone");
+                            ymp_alive = false;
                         }
-                    } else if ymp_alive && ymp_tx.send((buf[..n].to_vec(), from)).is_err() {
-                        tracing::debug!("demux: ymp consumer gone");
-                        ymp_alive = false;
                     }
-                }
-                Err(e) => {
-                    tracing::warn!("demux: read_from exiting: {e:?}");
-                    break;
-                }
+                    Err(e) => {
+                        tracing::warn!("demux: read_from exiting: {e:?}");
+                        break;
+                    }
+                },
             }
         }
     });
@@ -364,6 +390,35 @@ mod tests {
         let mut buf = [0u8; 8];
         let (n, _) = quic_view.read_from(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], &[0xC0, 0x77], "oversized must be dropped, not truncated");
+    }
+
+    /// Когда ушли оба потребителя, насос обязан выйти сам — не дожидаясь
+    /// следующих датаграмм. На остановленном узле их не будет вовсе, а старая
+    /// проверка «оба мертвы» стояла в начале цикла, после которого насос
+    /// парковался в `read_from` навсегда, держа Arc на Core.
+    ///
+    /// Наблюдаем через `Weak`: последняя сильная ссылка на соединение после
+    /// дропа обоих видов — та, что внутри задачи-насоса.
+    #[tokio::test]
+    async fn pump_exits_when_both_views_are_dropped_without_further_traffic() {
+        let (ka, kb) = keys();
+        // `_b` жива нарочно: пока её отправитель не уронили, `read_from` на
+        // стороне `a` будет ждать вечно, а не вернуть Closed.
+        let (a, _b) = MemPacketConn::pair(ka.clone(), kb);
+        let inner: Arc<dyn PacketConn> = a;
+        let weak = Arc::downgrade(&inner);
+
+        let (ymp_view, quic_view) = demux(inner, ka);
+        drop(ymp_view);
+        drop(quic_view);
+
+        for _ in 0..400 {
+            if weak.upgrade().is_none() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("demux pump must exit once both views are gone, without needing two more datagrams");
     }
 
     /// Если один потребитель ушёл, насос обязан продолжать обслуживать

@@ -14,6 +14,10 @@ use yggdrasil::links::PeerEvent;
 /// Tuned below the 30s base poll interval and far below the old ~75s cold-start stall.
 const READINESS_WAIT: Duration = Duration::from_secs(20);
 
+/// Пауза после неудачного или отложенного цикла — короче базового интервала,
+/// чтобы доставка возобновилась сразу, как сеть сойдётся.
+const FAST_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Start the outbound sender background task.
 /// Polls the queue every `interval`, gates on peer readiness, then sends via QUIC.
 ///
@@ -55,11 +59,11 @@ pub fn spawn(
                     match result {
                         Ok(()) => {
                             // ponytail: success → back to base interval
-                            interval = Duration::from_secs(30);
+                            interval = base_interval;
                         }
                         Err(_) => {
-                            // ponytail: failure or deferred (no up peer) → fast retry (10s)
-                            interval = Duration::from_secs(10);
+                            // ponytail: failure or deferred (no up peer) → fast retry
+                            interval = FAST_RETRY_INTERVAL;
                         }
                     }
                 }
