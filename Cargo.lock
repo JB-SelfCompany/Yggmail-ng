@@ -2854,6 +2854,7 @@ dependencies = [
  "ironwood",
  "rand 0.8.8",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
@@ -2862,6 +2863,7 @@ dependencies = [
  "tracing-android",
  "tracing-subscriber",
  "uniffi",
+ "url",
  "yggdrasil",
  "yggmail",
 ]
