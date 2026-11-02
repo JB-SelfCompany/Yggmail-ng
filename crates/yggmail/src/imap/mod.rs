@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use imap_core::error::ImapError;
-use imap_core::fetch::{FetchOptions, SectionSpecifier};
+use imap_core::fetch::FetchOptions;
 use imap_core::search::SearchCriteria;
 use imap_core::select::*;
 use imap_core::store::{StoreFlags, StoreOp};
@@ -237,24 +237,8 @@ impl UserSession for YggmailSession {
                 .mail_get(mb, id)
                 .map_err(|e| ImapError::Internal(Box::new(e)))?
             {
-                let body = if has_body {
-                    // Server writes msg.body as literal for each body section.
-                    // Filter based on section specifier.
-                    if let Some(bs) = options.body_sections.first() {
-                        match &bs.specifier {
-                            SectionSpecifier::HeaderFields(fields) => {
-                                extract_headers(&mail.mail, fields)
-                            }
-                            SectionSpecifier::Header => extract_header_end(&mail.mail),
-                            SectionSpecifier::None => mail.mail.clone(),
-                            _ => mail.mail.clone(),
-                        }
-                    } else {
-                        mail.mail.clone()
-                    }
-                } else {
-                    Vec::new()
-                };
+                // Whole message: imap-server cuts each requested section from it.
+                let body = if has_body { mail.mail.clone() } else { Vec::new() };
 
                 result.push(FetchedMessage {
                     seq,
@@ -590,49 +574,6 @@ fn epoch_days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 
 fn is_leap(y: u64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
-}
-
-/// Extract all headers (up to and including the blank line separator).
-fn extract_header_end(raw: &[u8]) -> Vec<u8> {
-    for i in 0..raw.len().saturating_sub(3) {
-        if raw[i] == b'\r' && raw[i + 1] == b'\n' && raw[i + 2] == b'\r' && raw[i + 3] == b'\n' {
-            return raw[..i + 4].to_vec();
-        }
-    }
-    raw.to_vec()
-}
-
-/// Extract only the requested headers from raw RFC 5322 mail.
-/// Handles folded continuation lines (RFC 5322 §2.2.3).
-fn extract_headers(raw: &[u8], field_names: &[String]) -> Vec<u8> {
-    let text = String::from_utf8_lossy(raw);
-    let mut result = Vec::new();
-    let mut copying = false;
-    for line in text.lines() {
-        if line.is_empty() {
-            break;
-        }
-        if line.starts_with(' ') || line.starts_with('\t') {
-            if copying {
-                result.extend_from_slice(line.as_bytes());
-                result.extend_from_slice(b"\r\n");
-            }
-            continue;
-        }
-        copying = false;
-        if let Some(colon) = line.find(':') {
-            let name = line[..colon].trim();
-            if field_names.iter().any(|f| f.eq_ignore_ascii_case(name)) {
-                result.extend_from_slice(line.as_bytes());
-                result.extend_from_slice(b"\r\n");
-                copying = true;
-            }
-        }
-    }
-    if !result.is_empty() {
-        result.extend_from_slice(b"\r\n");
-    }
-    result
 }
 
 #[cfg(test)]
