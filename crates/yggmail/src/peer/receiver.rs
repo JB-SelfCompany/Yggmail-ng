@@ -93,7 +93,8 @@ pub fn store(storage: &SqliteStorage, from_key: [u8; 32], data: &[u8]) -> Stored
     match storage.mail_insert_inbox_dedup(&from_key, data) {
         Ok(Some(id)) => {
             tracing::info!(
-                "receiver: stored in INBOX id={id} from {} ({} bytes)",
+                "receiver: stored in {} id={id} from {} ({} bytes)",
+                crate::storage::inbound_mailbox(data),
                 &from_addr[..16],
                 data.len()
             );

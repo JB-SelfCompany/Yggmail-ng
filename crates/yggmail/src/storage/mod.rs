@@ -30,6 +30,25 @@ pub(crate) fn lock_db(db: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
     })
 }
 
+/// Mailbox an inbound mail belongs in.
+///
+/// Tyr's built-in chat reads only `TyrChat`, and the Go engine (Tyr 1.8) filed
+/// every inbound mail carrying `X-Tyr-Chat: 1` there. Only the header block is
+/// scanned, so the same text in a body never reroutes an ordinary mail.
+pub fn inbound_mailbox(raw: &[u8]) -> &'static str {
+    let is_chat = raw
+        .split(|&b| b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
+        .take_while(|l| !l.is_empty())
+        .any(|l| match l.iter().position(|&b| b == b':') {
+            Some(i) => {
+                l[..i].eq_ignore_ascii_case(b"X-Tyr-Chat") && l[i + 1..].trim_ascii() == b"1"
+            }
+            None => false,
+        });
+    if is_chat { "TyrChat" } else { "INBOX" }
+}
+
 /// SQLite-backed mail storage.
 pub struct SqliteStorage {
     db: Arc<Mutex<Connection>>,
@@ -247,7 +266,8 @@ impl SqliteStorage {
         mails::insert(&self.db, mailbox, raw_rfc5322, self.at_rest_key.as_ref())
     }
 
-    /// Insert an inbound mail into INBOX, skipping exact duplicates.
+    /// Insert an inbound mail, skipping exact duplicates. The mailbox comes from
+    /// [`inbound_mailbox`]: Tyr chat mail goes to `TyrChat`, the rest to INBOX.
     ///
     /// Returns `Ok(Some(id))` if stored, `Ok(None)` if it was a duplicate.
     ///
@@ -297,7 +317,14 @@ impl SqliteStorage {
         // The fingerprint and the mail commit together: if the insert below
         // fails, the whole transaction rolls back and no fingerprint remains,
         // so a retry stores the mail instead of treating it as a duplicate.
-        let id = mails::insert_with(&tx, "INBOX", raw, self.at_rest_key.as_ref())?;
+        let mailbox = inbound_mailbox(raw);
+        if mailbox != "INBOX" {
+            tx.execute(
+                "INSERT OR IGNORE INTO mailboxes (mailbox) VALUES (?1)",
+                [mailbox],
+            )?;
+        }
+        let id = mails::insert_with(&tx, mailbox, raw, self.at_rest_key.as_ref())?;
         tx.commit()?;
         Ok(Some(id))
     }
@@ -582,6 +609,29 @@ mod tests {
         assert!(
             stored.is_some(),
             "retry after a failed insert must store the mail"
+        );
+    }
+
+    /// Встроенный чат Tyr читает только ящик TyrChat. Движок 1.8 (Go) клал туда
+    /// каждое входящее письмо с `X-Tyr-Chat: 1`; без этого чат-сообщения от
+    /// узлов 1.8 тонут в INBOX и в чате не появляются никогда.
+    #[test]
+    fn tyr_chat_mail_routes_to_tyrchat_mailbox() {
+        let s = temp_db("tyrchat_route");
+        let from = [0x22u8; 32];
+        // Регистр заголовка — как у любого RFC 5322 поля, произвольный.
+        let chat = b"From: a@yggmail\r\nx-tyr-chat: 1\r\n\r\nhi\r\n";
+        // Та же строка, но в теле: это обычное письмо, не чат.
+        let plain = b"From: a@yggmail\r\nSubject: q\r\n\r\nX-Tyr-Chat: 1\r\n";
+
+        s.mail_insert_inbox_dedup(&from, chat).unwrap().expect("chat mail stored");
+        s.mail_insert_inbox_dedup(&from, plain).unwrap().expect("plain mail stored");
+
+        assert_eq!(s.mail_count("TyrChat").unwrap(), 1, "chat mail must land in TyrChat");
+        assert_eq!(s.mail_count("INBOX").unwrap(), 1, "only the plain mail stays in INBOX");
+        assert!(
+            s.mailbox_list().unwrap().iter().any(|m| m == "TyrChat"),
+            "TyrChat must exist as a mailbox so IMAP SELECT TyrChat succeeds"
         );
     }
 
