@@ -29,7 +29,16 @@ impl CoreConn {
 #[async_trait::async_trait]
 impl PacketConn for CoreConn {
     async fn read_from(&self, buf: &mut [u8]) -> IwResult<(usize, Addr)> {
-        self.core.read_from(buf).await
+        // Core reads the frame in place, type byte included, and returns where
+        // the payload sits. Give it one spare byte so a full `buf.len()` payload
+        // still fits — a maximal YMP fragment (65520 + 15 = PUMP_BUF_BYTES)
+        // would otherwise be cut. Same per-read allocation Core itself did
+        // before v0.3.1.
+        let mut frame = vec![0u8; buf.len() + 1];
+        let (payload, addr) = self.core.read_from(&mut frame).await?;
+        let n = payload.len();
+        buf[..n].copy_from_slice(&frame[payload]);
+        Ok((n, addr))
     }
 
     async fn write_to(&self, buf: &[u8], addr: &Addr) -> IwResult<usize> {
