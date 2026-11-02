@@ -36,6 +36,10 @@ dictionary MailSummary {
     u32     size;
 };
 
+callback interface PickListener {
+    void on_progress(string stage, u32 done, u32 total);
+};
+
 interface YggmailMobile {
     [Throws=YggmailError]
     constructor();
@@ -79,6 +83,12 @@ interface YggmailMobile {
     // Peer management
     void update_peers(string peers_json);
     string get_peer_connections_json();
+
+    /// Pick the best public peer (blocks ~1 min; call off the service thread).
+    /// Returns {"verdict","switch","gain","backup","rows":[{uri,host,country,latencyMs,depth,usable}]}.
+    [Throws=YggmailError]
+    string pick_peers(string catalog_json, sequence<string> enabled, sequence<string> disabled, PickListener listener);
+    void cancel_pick();
 
     // Storage/quota
     void set_max_message_size_mb(u64 mb);

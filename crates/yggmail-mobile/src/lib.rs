@@ -2,6 +2,8 @@
 
 uniffi::include_scaffolding!("yggmail_mobile");
 
+mod picker;
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once};
@@ -128,6 +130,12 @@ pub struct YggmailMobile {
     active: AtomicBool,
     charging: AtomicBool,
     max_message_size: AtomicU64,
+    pick_cancel: AtomicBool,
+}
+
+/// Progress of `pick_peers`, implemented on the Kotlin side.
+pub trait PickListener: Send + Sync {
+    fn on_progress(&self, stage: String, done: u32, total: u32);
 }
 
 impl YggmailMobile {
@@ -143,6 +151,7 @@ impl YggmailMobile {
             active: AtomicBool::new(false),
             charging: AtomicBool::new(false),
             max_message_size: AtomicU64::new(0),
+            pick_cancel: AtomicBool::new(false),
         })
     }
 
@@ -573,6 +582,53 @@ impl YggmailMobile {
                 }
             }
         });
+    }
+
+    pub fn pick_peers(
+        &self,
+        catalog_json: String,
+        enabled: Vec<String>,
+        disabled: Vec<String>,
+        listener: Box<dyn PickListener>,
+    ) -> Result<String, YggmailError> {
+        // Clone the core and drop the lock: a pick takes ~1 min and must not block every other call.
+        let core = self
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|n| n.core.clone())
+            .ok_or(YggmailError::Runtime("not started".into()))?;
+        self.pick_cancel.store(false, Ordering::Relaxed);
+        let progress = |stage: &str, done: usize, total: usize| listener.on_progress(stage.into(), done as u32, total as u32);
+        let report = self
+            .runtime
+            .block_on(picker::run(core, &catalog_json, enabled, disabled, progress, &self.pick_cancel))
+            .map_err(|e| YggmailError::Network(e.to_string()))?;
+        let (verdict, switch, gain) = match &report.verdict {
+            picker::Verdict::Switch { uri, gain_pct } => ("switch", uri.as_str(), gain_pct.map_or(-1, |g| g as i64)),
+            picker::Verdict::Keep(reason) => (*reason, "", -1),
+        };
+        let rows: Vec<serde_json::Value> = report
+            .rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "uri": r.uri, "host": r.host, "country": r.country,
+                    "latencyMs": r.latency_ms, "depth": r.depth, "usable": r.score.is_finite(),
+                    "reason": r.reason.map(|x| format!("{x:?}")),
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "verdict": verdict, "switch": switch, "gain": gain,
+            "backup": report.backup.unwrap_or_default(), "rows": rows,
+        })
+        .to_string())
+    }
+
+    pub fn cancel_pick(&self) {
+        self.pick_cancel.store(true, Ordering::Relaxed);
     }
 
     pub fn get_peer_connections_json(&self) -> String {

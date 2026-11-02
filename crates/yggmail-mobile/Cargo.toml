@@ -20,6 +20,9 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 hex = "0.4"
 thiserror = "2"
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+# Already in the graph (2.5.x, via the core); the peer picker parses catalog URIs with it.
+url = "2"
 sha2 = "0.10"
 rusqlite = { version = "0.32", features = ["bundled"] }
 rand = "0.8"
