@@ -1,0 +1,3 @@
+# UDL-mode bindgen would otherwise load "uniffi_yggmail_mobile"; the cdylib is libyggmail_mobile.so.
+[bindings.kotlin]
+cdylib_name = "yggmail_mobile"
