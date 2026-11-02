@@ -164,16 +164,16 @@ for target in "${SELECTED[@]}"; do
         -- build --release -p yggmail-mobile
 done
 
-# Bindings are arch-independent: use the .so from the FIRST selected target,
-# never a hardcoded aarch64 path (would break for x86-only builds).
-FIRST_TRIPLE="${SELECTED[0]}"
-SO_PATH="target/${FIRST_TRIPLE}/release/libyggmail_mobile.so"
+# From the UDL, not the .so: the release profile strips the .so, which removes the
+# UniFFI metadata, and bindgen then writes nothing - silently leaving stale bindings.
+UDL="crates/yggmail-mobile/src/yggmail_mobile.udl"
 
-echo "--- Generating Kotlin bindings (from $SO_PATH) ---"
+echo "--- Generating Kotlin bindings (from $UDL) ---"
 cargo run --bin uniffi-bindgen -- generate \
-    --lib-file "$SO_PATH" \
     --language kotlin \
-    --out-dir kotlin-bindings
+    --out-dir kotlin-bindings \
+    --no-format \
+    "$UDL"
 
 echo ""
 echo "=== Done! ==="

@@ -158,16 +158,16 @@ foreach ($target in $selected) {
     }
 }
 
-# Bindings are arch-independent: use the .so from the FIRST selected target,
-# never a hardcoded aarch64 path (would break for x86-only builds).
-$firstTriple = $selected[0]
-$soPath = "target\$firstTriple\release\libyggmail_mobile.so"
+# From the UDL, not the .so: the release profile strips the .so, which removes the
+# UniFFI metadata, and bindgen then writes nothing - silently leaving stale bindings.
+$udl = 'crates\yggmail-mobile\src\yggmail_mobile.udl'
 
-Write-Host "--- Generating Kotlin bindings (from $soPath) ---"
+Write-Host "--- Generating Kotlin bindings (from $udl) ---"
 & cargo run --bin uniffi-bindgen -- generate `
     --language kotlin `
     --out-dir kotlin-bindings `
-    $soPath
+    --no-format `
+    $udl
 if ($LASTEXITCODE -ne 0) {
     throw 'uniffi-bindgen failed'
 }
