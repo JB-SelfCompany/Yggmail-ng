@@ -1,3 +1,5 @@
+> **Moved / Переехал:** development continues at https://git.shd.company/bubblegum/Yggmail-ng. This GitHub copy is archived.
+
 <div align="center">
 
 # yggmail-ng
